@@ -16,6 +16,7 @@ from transformers import AutoTokenizer
 from langchain_core.documents import Document as LangchainDocument
 from typing import Optional, List
 from sentence_transformers import SentenceTransformer
+import torch
 
 
 PG_CONN = os.getenv("PG_CONN")
@@ -91,9 +92,14 @@ class RAGEmbedder:
     def __init__(self):
         self.tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME)
 
+        st_model = SentenceTransformer(
+            EMBEDDING_MODEL_NAME,
+            model_kwargs={"torch_dtype": torch.float16},
+        )
+
         self.embeddings = HuggingFaceEmbeddings(
+            model = st_model,
             model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={"torch_dtype": "torch.float16"},
             encode_kwargs={"normalize_embeddings": True},
         )
 
