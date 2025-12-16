@@ -85,7 +85,7 @@ class SearchResponse(BaseModel):
 
 @serve.deployment(
     num_replicas=1,
-    ray_actor_options={"num_cpus": 1, "num_gpus": 0},
+    ray_actor_options={"num_cpus": 4, "num_gpus": 1},
 )
 @serve.ingress(app)
 class RAGEmbedder:
