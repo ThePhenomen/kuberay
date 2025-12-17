@@ -110,7 +110,7 @@ class RAGReader:
         context += "".join(
             [f"Document {str(i)}:::\n" + doc for i, doc in enumerate(retrieved_docs)]
         )
-        final_promt = self.internal_promt_template.format(
+        final_promt = self.internal_rag_promt_template.format(
             question=req.query, context=context
         )
 
