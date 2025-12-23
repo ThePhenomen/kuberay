@@ -4,7 +4,7 @@ from fastapi import FastAPI
 import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from pydantic import BaseModel
-from peft import PeftModel
+from peft import PeftModelForCausalLM
 import pyarrow.fs as pa_fs
 
 MODEL_NAME = os.getenv(
@@ -64,7 +64,8 @@ class WIKIHelper:
     def __init__(self):
         download_checkpoint_from_s3()
         self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-        self.model = PeftModel.from_pretrained(self.model, os.path.join(checkpoint_path, "checkpoint"))
+        self.model = PeftModelForCausalLM.from_pretrained(self.model, os.path.join(checkpoint_path, "checkpoint"))
+        self.model = self.model.merge_and_unload()
 
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         self.pipe = pipeline(
