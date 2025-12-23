@@ -37,7 +37,14 @@ def download_checkpoint_from_s3():
         anonymous=True,
         tls_ca_file_path="/etc/ssl/certs/ca-certificates.crt",
     )
-    pa_fs.copy_files(S3_CHECKPOINT_ADDRESS, checkpoint_path, fs)
+    print("Downloading remote checkpoint folder {S3_CHECKPOINT_ADDRESS} local...")
+    pa_fs.copy_files(
+        source=S3_CHECKPOINT_ADDRESS, 
+        destination=checkpoint_path, 
+        source_filesystem=fs
+    )
+    print("Checkpoint available at {checkpoint_path}")
+
 
 app = FastAPI()
 
@@ -55,6 +62,7 @@ class OutputAnswer(BaseModel):
 class WIKIHelper:
 
     def __init__(self):
+        download_checkpoint_from_s3()
         self.model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
         self.model = PeftModel.from_pretrained(self.model, os.path.join(checkpoint_path, "checkpoint"))
 
