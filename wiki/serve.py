@@ -13,7 +13,7 @@ MODEL_NAME = os.getenv(
 )
 S3_CHECKPOINT_ADDRESS = os.getenv("S3_CHECKPOINT_ADDRESS")
 
-checkpoint_path = "/mnt/ray/lora"
+checkpoint_path = "/home/ray/local_checkpoints/lora"
 
 system_wiki_promt = [
     {
