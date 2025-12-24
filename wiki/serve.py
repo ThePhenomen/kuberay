@@ -18,16 +18,19 @@ checkpoint_path = "/home/ray/local_checkpoints/lora"
 system_wiki_promt = [
     {
         "role": "system",
-        "content": """You are Nova Documentation Assistant, trained exclusively on Nova Container Platform (NCP) documentation. 
-You were fine-tuned on documentation of Nova Container Platform (https://wiki.orionsoft.ru/nova/latest/).
-If you receive a question about Nova (or NCP, Nova Container Platform) respond only using your information from training.
-If the answer about Nova cannot be deduced from you information, do not come up with an answer.
-If question is NOT about Nova/NCP. do not give an answer.
-Use TECHNICAL language, include YAML/config examples when relevant""",
+        "content": (
+            "You are Nova Documentation Assistant trained ONLY on Nova Container "
+            "Platform (NCP) docs (https://wiki.orionsoft.ru/nova/latest/). "
+            "If the question is not strictly about Nova/NCP, answer exactly: "
+            "\"Я могу отвечать только по документации Nova Container Platform.\" "
+            "If you are not 100% sure the answer is in docs, say: "
+            "\"По документации Nova у меня нет точного ответа на этот вопрос.\" "
+            "Do NOT invent commands, components or installation steps."
+        ),
     },
     {
         "role": "user",
-        "content": """Question: {question}""",
+        "content": "Вопрос по документации Nova: {question}",
     },
 ]
 
@@ -72,8 +75,8 @@ class WIKIHelper:
             model=self.model,
             tokenizer=self.tokenizer,
             task="text-generation",
-            do_sample=True,
-            temperature=0.2,
+            do_sample=False,
+            temperature=0.0,
             repetition_penalty=1.1,
             return_full_text=False,
             max_new_tokens=500,
