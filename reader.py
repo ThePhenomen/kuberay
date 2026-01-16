@@ -64,7 +64,7 @@ class OutputAnswer(BaseModel):
 class RAGReader:
 
     def __init__(self):
-        self.model = AutoModelForCausalLM.from_pretrained(READER_MODEL_NAME, torch_dtype=torch.float16, local_files_only=True)
+        self.model = AutoModelForCausalLM.from_pretrained(READER_MODEL_NAME, torch_dtype=torch.float16, local_files_only=True, low_cpu_mem_usage=True, device_map="cuda")
         self.tokenizer = AutoTokenizer.from_pretrained(READER_MODEL_NAME)
         self.pipe = pipeline(
             model=self.model,
