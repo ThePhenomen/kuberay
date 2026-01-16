@@ -90,7 +90,7 @@ class SearchResponse(BaseModel):
 @serve.ingress(app)
 class RAGEmbedder:
     def __init__(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME)
+        self.tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME, low_cpu_mem_usage=True, device_map="cuda")
 
         self.embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_NAME,
