@@ -6,6 +6,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from pydantic import BaseModel
 from langchain_core.documents import Document as LangchainDocument
 import requests
+import torch
 
 READER_MODEL_NAME = os.getenv(
     "READER_MODEL_NAME",
@@ -57,13 +58,13 @@ class OutputAnswer(BaseModel):
 
 @serve.deployment(
     num_replicas=1,
-    ray_actor_options={"num_cpus": 4, "num_gpus": 1},
+    ray_actor_options={"num_cpus": 8, "num_gpus": 1},
 )
 @serve.ingress(app)
 class RAGReader:
 
     def __init__(self):
-        self.model = AutoModelForCausalLM.from_pretrained(READER_MODEL_NAME)
+        self.model = AutoModelForCausalLM.from_pretrained(READER_MODEL_NAME, torch_dtype=torch.float16)
         self.tokenizer = AutoTokenizer.from_pretrained(READER_MODEL_NAME)
         self.pipe = pipeline(
             model=self.model,
