@@ -58,7 +58,7 @@ class OutputAnswer(BaseModel):
 
 @serve.deployment(
     num_replicas=1,
-    ray_actor_options={"num_cpus": 8, "num_gpus": 1},
+    ray_actor_options={"num_cpus": 12, "num_gpus": 1},
 )
 @serve.ingress(app)
 class RAGReader:
