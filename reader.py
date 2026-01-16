@@ -10,7 +10,7 @@ import torch
 
 READER_MODEL_NAME = os.getenv(
     "READER_MODEL_NAME",
-    "/mnt/models",
+    "Qwen/Qwen2.5-0.5B-Instruct",
 )
 SEARCH_EMBDDER_URL = os.getenv(
     "SEARCH_EMBDDER_URL",
