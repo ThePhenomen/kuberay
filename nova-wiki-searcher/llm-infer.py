@@ -1,5 +1,6 @@
 # app.py
 import os
+import json
 from typing import List, Dict, Any
 
 import requests
@@ -176,6 +177,7 @@ class OpenAIAdapter:
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(self, request: Request):
         body: Dict[str, Any] = await request.json()
+        print("Тело", body)
 
         model = body.get("model", "qwen-wiki")
         messages = body.get("messages", [])
@@ -201,7 +203,8 @@ class OpenAIAdapter:
         #     )
 
         #answer_text = resp.answer
-        answer_text = body
+        answer_text = json.dumps(body, ensure_ascii=False, indent=2)
+        print(answer_text)
 
         return ChatCompletionResponse(
             id="chatcmpl-custom-1",
