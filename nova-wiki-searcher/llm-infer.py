@@ -19,7 +19,6 @@ SEARCH_EMBEDDER_URL = os.getenv(
     "http://wiki-searcher.nova-wiki.svc.cluster.local:8000/search",
 )
 
-
 prompt_in_chat_format_for_rag = [
     {
         "role": "system",
@@ -41,7 +40,6 @@ Question: {question}""",
     },
 ]
 
-
 prompt_in_chat_format = [
     {
         "role": "system",
@@ -54,7 +52,7 @@ prompt_in_chat_format = [
 ]
 
 
-# ----- Внутренние модели запросов/ответов RAGReader -----
+# ----- внутренние модели -----
 
 class InputQuestion(BaseModel):
     query: str
@@ -83,16 +81,17 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
 
 
+# Один общий FastAPI для всего приложения
+app = FastAPI()
+
+
 # ----- RAGReader deployment -----
-
-rag_app = FastAPI()
-
 
 @serve.deployment(
     num_replicas=1,
     ray_actor_options={"num_cpus": 8, "num_gpus": 1},
 )
-@serve.ingress(rag_app)
+@serve.ingress(app)
 class RAGReader:
     def __init__(self):
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -117,7 +116,7 @@ class RAGReader:
             prompt_in_chat_format, tokenize=False, add_generation_prompt=True
         )
 
-    @rag_app.post("/question", response_model=OutputAnswer)
+    @app.post("/question", response_model=OutputAnswer)
     def make_prediction(self, req: InputQuestion) -> OutputAnswer:
         print("Got query:", req.query)
 
@@ -127,7 +126,7 @@ class RAGReader:
         answer = self.pipe(final_prompt)
         return OutputAnswer(answer=answer[0]["generated_text"])
 
-    @rag_app.post("/wiki-question", response_model=OutputAnswer)
+    @app.post("/wiki-question", response_model=OutputAnswer)
     def make_context_prediction(self, req: InputQuestion) -> OutputAnswer:
         print("Got query:", req.query)
 
@@ -156,18 +155,15 @@ class RAGReader:
 rag_reader_app = RAGReader.bind()
 
 
+# ----- OpenAI-совместимый адаптер -----
 
 @serve.deployment
-@serve.ingress(rag_app)
+@serve.ingress(app)
 class OpenAIAdapter:
-    """
-    Принимает /v1/chat/completions от OpenWebUI и вызывает RAGReader через handle.
-    """
-
     def __init__(self, rag_handle):
         self.rag = rag_handle
 
-    @rag_app.get("/v1/models")
+    @app.get("/v1/models")
     async def list_models(self):
         return {
             "object": "list",
@@ -180,9 +176,9 @@ class OpenAIAdapter:
             ],
         }
 
-    @rag_app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+    @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(self, request: Request):
-        body = await request.json()
+        body: Dict[str, Any] = await request.json()
 
         model = body.get("model", "qwen-wiki")
         messages = body.get("messages", [])
