@@ -156,13 +156,9 @@ class RAGReader:
 rag_reader_app = RAGReader.bind()
 
 
-# ----- OpenAI-совместимый ingress поверх RAGReader -----
-
-openai_app_fastapi = FastAPI()
-
 
 @serve.deployment
-@serve.ingress(openai_app_fastapi)
+@serve.ingress(rag_app)
 class OpenAIAdapter:
     """
     Принимает /v1/chat/completions от OpenWebUI и вызывает RAGReader через handle.
@@ -171,7 +167,7 @@ class OpenAIAdapter:
     def __init__(self, rag_handle):
         self.rag = rag_handle
 
-    @openai_app_fastapi.get("/v1/models")
+    @rag_app.get("/v1/models")
     async def list_models(self):
         return {
             "object": "list",
@@ -184,7 +180,7 @@ class OpenAIAdapter:
             ],
         }
 
-    @openai_app_fastapi.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+    @rag_app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(self, request: Request):
         body = await request.json()
 
