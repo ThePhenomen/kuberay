@@ -181,8 +181,7 @@ class OpenAIAdapter:
 
         model = body.get("model", "qwen-wiki")
         messages = body.get("messages", [])
-        metadata = body.get("metadata", {}) or {}
-        nova_version = metadata.get("nova_version", "latest")
+        nova_version = body.get("nova_version", "latest")
 
         # последний user message
         user_msg = next(
