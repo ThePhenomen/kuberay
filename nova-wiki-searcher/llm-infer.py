@@ -91,7 +91,6 @@ app = FastAPI()
     num_replicas=1,
     ray_actor_options={"num_cpus": 8, "num_gpus": 1},
 )
-@serve.ingress(app)
 class RAGReader:
     def __init__(self):
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -116,7 +115,6 @@ class RAGReader:
             prompt_in_chat_format, tokenize=False, add_generation_prompt=True
         )
 
-    @app.post("/question", response_model=OutputAnswer)
     def make_prediction(self, req: InputQuestion) -> OutputAnswer:
         print("Got query:", req.query)
 
@@ -126,7 +124,6 @@ class RAGReader:
         answer = self.pipe(final_prompt)
         return OutputAnswer(answer=answer[0]["generated_text"])
 
-    @app.post("/wiki-question", response_model=OutputAnswer)
     def make_context_prediction(self, req: InputQuestion) -> OutputAnswer:
         print("Got query:", req.query)
 
