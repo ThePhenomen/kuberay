@@ -1,12 +1,13 @@
-from ray import serve
-from transformers import pipeline
-from fastapi import FastAPI, HTTPException, Request
+# app.py
 import os
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from pydantic import BaseModel
-from langchain_core.documents import Document as LangchainDocument
+from typing import List, Dict, Any
+
 import requests
 import torch
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from ray import serve
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 
 READER_MODEL_NAME = os.getenv(
@@ -15,7 +16,7 @@ READER_MODEL_NAME = os.getenv(
 )
 SEARCH_EMBEDDER_URL = os.getenv(
     "SEARCH_EMBEDDER_URL",
-    "http://127.0.0.1:8000/search",
+    "http://wiki-searcher.nova-wiki.svc.cluster.local:8000/search",
 )
 
 
@@ -53,8 +54,7 @@ prompt_in_chat_format = [
 ]
 
 
-app = FastAPI()
-
+# ----- Внутренние модели запросов/ответов RAGReader -----
 
 class InputQuestion(BaseModel):
     query: str
@@ -64,13 +64,36 @@ class OutputAnswer(BaseModel):
     answer: str
 
 
+# ----- OpenAI-совместимые модели -----
+
+class ChatCompletionResponseChoiceMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionResponseChoice(BaseModel):
+    index: int
+    message: ChatCompletionResponseChoiceMessage
+    finish_reason: str
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str
+    choices: List[ChatCompletionResponseChoice]
+
+
+# ----- RAGReader deployment -----
+
+rag_app = FastAPI()
+
+
 @serve.deployment(
     num_replicas=1,
     ray_actor_options={"num_cpus": 8, "num_gpus": 1},
 )
-@serve.ingress(app)
+@serve.ingress(rag_app)
 class RAGReader:
-
     def __init__(self):
         self.model = AutoModelForCausalLM.from_pretrained(
             READER_MODEL_NAME, torch_dtype=torch.float16
@@ -94,41 +117,117 @@ class RAGReader:
             prompt_in_chat_format, tokenize=False, add_generation_prompt=True
         )
 
-    @app.post("/question", response_model=OutputAnswer)
+    @rag_app.post("/question", response_model=OutputAnswer)
     def make_prediction(self, req: InputQuestion) -> OutputAnswer:
         print("Got query:", req.query)
 
-        final_promt = self.internal_promt_template.format(
+        final_prompt = self.internal_promt_template.format(
             question=req.query
         )
-
-        answer = self.pipe(final_promt)
+        answer = self.pipe(final_prompt)
         return OutputAnswer(answer=answer[0]["generated_text"])
 
-    @app.post("/wiki-question", response_model=OutputAnswer)
-    async def make_context_prediction(self, request: Request) -> OutputAnswer:
-        """
-        Обрабатываем тело запроса от OpenWebUI целиком, чтобы вытащить metadata.nova_version.
-        Ожидается формат body, который ты привёл в примере.
-        """
+    @rag_app.post("/wiki-question", response_model=OutputAnswer)
+    def make_context_prediction(self, req: InputQuestion) -> OutputAnswer:
+        print("Got query:", req.query)
+
+        url = SEARCH_EMBEDDER_URL
+        payload = {"query": req.query}
+        response = requests.post(url, json=payload, timeout=30)
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Embedder returned {response.status_code}: {response.text}",
+            )
+
+        retrieved_docs = [d["page_content"] for d in response.json()["retrieved_docs"]]
+        context = "\nExtracted documents:\n"
+        context += "".join(
+            [f"Document {str(i)}:::\n" + doc for i, doc in enumerate(retrieved_docs)]
+        )
+        final_prompt = self.internal_rag_promt_template.format(
+            question=req.query, context=context
+        )
+
+        answer = self.pipe(final_prompt)
+        return OutputAnswer(answer=answer[0]["generated_text"])
+
+
+rag_reader_app = RAGReader.bind()
+
+
+# ----- OpenAI-совместимый ingress поверх RAGReader -----
+
+openai_app_fastapi = FastAPI()
+
+
+@serve.deployment
+@serve.ingress(openai_app_fastapi)
+class OpenAIAdapter:
+    """
+    Принимает /v1/chat/completions от OpenWebUI и вызывает RAGReader через handle.
+    """
+
+    def __init__(self, rag_handle):
+        self.rag = rag_handle
+
+    @openai_app_fastapi.get("/v1/models")
+    async def list_models(self):
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": "qwen-wiki",
+                    "object": "model",
+                    "owned_by": "custom",
+                }
+            ],
+        }
+
+    @openai_app_fastapi.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+    async def chat_completions(self, request: Request):
         body = await request.json()
 
-        # 1. Извлекаем вопрос и версию
-        # Если ты по-прежнему хочешь использовать InputQuestion, можно взять query из messages
+        model = body.get("model", "qwen-wiki")
         messages = body.get("messages", [])
-        # берём последний user-message
+        metadata = body.get("metadata", {}) or {}
+        nova_version = metadata.get("nova_version", "latest")
+
+        # последний user message
         user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), {}
         )
         query = user_msg.get("content", "")
 
-        metadata = body.get("metadata", {}) or {}
-        nova_version = metadata.get("nova_version", "latest")
+        print(f"[OpenAIAdapter] model={model}, nova_version={nova_version}, query={query!r}")
 
-        print(f"Got query: {query}")
-        print(f"nova_version from metadata: {nova_version}")
+        # if model == "qwen-wiki" or "wiki" in model:
+        #     # вызываем wiki-question через Ray Serve handle
+        #     resp: OutputAnswer = await self.rag.make_context_prediction.remote(
+        #         InputQuestion(query=query)
+        #     )
+        # else:
+        #     resp: OutputAnswer = await self.rag.make_prediction.remote(
+        #         InputQuestion(query=query)
+        #     )
 
-        return OutputAnswer(answer=body)
+        #answer_text = resp.answer
+        answer_text = body
+
+        return ChatCompletionResponse(
+            id="chatcmpl-custom-1",
+            object="chat.completion",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatCompletionResponseChoiceMessage(
+                        role="assistant",
+                        content=answer_text,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+        )
 
 
-rag_reader_app = RAGReader.bind()
+openai_app = OpenAIAdapter.bind(rag_reader_app)
