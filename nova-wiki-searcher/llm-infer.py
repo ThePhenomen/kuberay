@@ -176,6 +176,7 @@ class OpenAIAdapter:
 
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(self, request: Request):
+        print(request.json())
         body: Dict[str, Any] = await request.json()
         print("Тело", body)
 
