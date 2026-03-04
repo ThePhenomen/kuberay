@@ -156,7 +156,7 @@ class RAGReader:
         return OutputAnswer(answer=answer[0]["generated_text"])
 
     def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
-        print("Got query:", req.query)
+        print("Got wiki query:", req.query)
 
         docs = self.nova_collection.query.hybrid(
             query=req.query,
@@ -175,6 +175,8 @@ class RAGReader:
             question=req.query, context=context
         )
 
+        llm_answer_init = self.pipe(final_prompt)
+        print("Wiki answer:", llm_answer_init)
         llm_answer = self.pipe(final_prompt)[0]["generated_text"]
         answer = llm_answer + f"\nИсточники:\n{sources}"
         return OutputAnswer(answer=answer)
