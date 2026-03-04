@@ -1,23 +1,42 @@
-# app.py
 import os
 import json
 from typing import List, Dict, Any
 
-import requests
 import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from ray import serve
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
+import weaviate
+from weaviate.classes.init import Auth
+from weaviate.classes.config import Configure, Property, DataType
+from weaviate.classes.query import Filter
 
-READER_MODEL_NAME = os.getenv(
+MODEL_NAME = os.getenv(
     "READER_MODEL_NAME",
     "Qwen/Qwen2.5-0.5B-Instruct",
 )
-SEARCH_EMBEDDER_URL = os.getenv(
-    "SEARCH_EMBEDDER_URL",
-    "http://wiki-searcher.nova-wiki.svc.cluster.local:8000/search",
+NOVA_COLLECTION_NAME = os.getenv(
+    "NOVA_COLLECTION_NAME", 
+    "NovaWikiDocs"
+)
+WEAVIATE_GRPC_ADDR = os.getenv(
+    "WEAVIATE_GRPC_ADDR", 
+    "weaviate-grpc.nova-weaviate.svc"
+)
+WEAVIATE_GRPC_PORT = int(os.getenv
+    ("WEAVIATE_GRPC_PORT", "50051"
+))
+WEAVIATE_HTTP_ADDR = os.getenv(
+    "WEAVIATE_HTTP_ADDR", 
+    "weaviate.nova-weaviate.svc"
+)
+WEAVIATE_HTTP_PORT = int(os.getenv(
+    "WEAVIATE_HTTP_PORT", "80"
+))
+WEAVIATE_API_TOKEN = os.getenv(
+    "WEAVIATE_API_TOKEN"
 )
 
 prompt_in_chat_format_for_rag = [
@@ -35,8 +54,6 @@ If the answer cannot be deduced from the context, do not give an answer.""",
 {context}
 ---
 Now here is the question you need to answer.
-
-
 Question: {question}""",
     },
 ]
@@ -44,7 +61,11 @@ Question: {question}""",
 prompt_in_chat_format = [
     {
         "role": "system",
-        "content": """You are Qwen, created by Alibaba Cloud. You are a helpful assistant. You are ready to answer every question you receive.""",
+        "content": """You are Qwen, created by Alibaba Cloud. 
+You are a helpful assistant. 
+You are ready to answer every question you receive.
+You will receive promts from OpenWebUI to generate context for users.
+Answer very precisely only to provided questions""",
     },
     {
         "role": "user",
@@ -52,52 +73,42 @@ prompt_in_chat_format = [
     },
 ]
 
-
-# ----- внутренние модели -----
+class InputRagQuestion(BaseModel):
+    query: str
+    nova_version: str
 
 class InputQuestion(BaseModel):
     query: str
 
-
 class OutputAnswer(BaseModel):
     answer: str
-
-
-# ----- OpenAI-совместимые модели -----
 
 class ChatCompletionResponseChoiceMessage(BaseModel):
     role: str
     content: str
-
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatCompletionResponseChoiceMessage
     finish_reason: str
 
-
 class ChatCompletionResponse(BaseModel):
     id: str
     object: str
     choices: List[ChatCompletionResponseChoice]
 
-
-# Один общий FastAPI для всего приложения
 app = FastAPI()
-
-
-# ----- RAGReader deployment -----
 
 @serve.deployment(
     num_replicas=1,
-    ray_actor_options={"num_cpus": 8, "num_gpus": 1},
+    ray_actor_options={"num_cpus": 8},
 )
 class RAGReader:
     def __init__(self):
         self.model = AutoModelForCausalLM.from_pretrained(
-            READER_MODEL_NAME, torch_dtype=torch.float16
+            MODEL_NAME, torch_dtype=torch.float16
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(READER_MODEL_NAME)
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         self.pipe = pipeline(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -116,6 +127,25 @@ class RAGReader:
             prompt_in_chat_format, tokenize=False, add_generation_prompt=True
         )
 
+        try:
+            self.weaviate_connection = weaviate.connect_to_custom(
+                http_host=WEAVIATE_HTTP_ADDR,
+                http_port=WEAVIATE_HTTP_PORT,
+                http_secure=False,
+                grpc_host=WEAVIATE_GRPC_ADDR,
+                grpc_port=WEAVIATE_GRPC_PORT,
+                grpc_secure=False,
+                auth_credentials=Auth.api_key(WEAVIATE_API_TOKEN),
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to connect to Weaviate: {e}") from e
+        
+        if not self.weaviate_connection.is_ready():
+            self.weaviate_connection.close()
+            raise RuntimeError("Weaviate is not ready, aborting RAGReader initialization")
+        
+        self.nova_collection = self.weavite_connection.collections.use(NOVA_COLLECTION_NAME)
+
     def make_prediction(self, req: InputQuestion) -> OutputAnswer:
         print("Got query:", req.query)
 
@@ -125,35 +155,42 @@ class RAGReader:
         answer = self.pipe(final_prompt)
         return OutputAnswer(answer=answer[0]["generated_text"])
 
-    def make_context_prediction(self, req: InputQuestion) -> OutputAnswer:
+    def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
         print("Got query:", req.query)
 
-        url = SEARCH_EMBEDDER_URL
-        payload = {"query": req.query}
-        response = requests.post(url, json=payload, timeout=30)
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Embedder returned {response.status_code}: {response.text}",
-            )
-
-        retrieved_docs = [d["page_content"] for d in response.json()["retrieved_docs"]]
-        context = "\nExtracted documents:\n"
-        context += "".join(
-            [f"Document {str(i)}:::\n" + doc for i, doc in enumerate(retrieved_docs)]
+        docs = self.nova_collection.query.hybrid(
+            query=req.query,
+            limit=3,
+            filters=Filter.by_property("version").equal(req.nova_version),
         )
+
+        if not docs.objects:
+            return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
+
+        texts = [obj.properties["page_content"] for obj in docs.objects]
+        links = [obj.properties["source"] for obj in docs.objects]
+        sources = "\n".join(links)
+        context = "\n\n---\n\n".join(texts)
         final_prompt = self.internal_rag_promt_template.format(
             question=req.query, context=context
         )
 
-        answer = self.pipe(final_prompt)
-        return OutputAnswer(answer=answer[0]["generated_text"])
+        llm_answer = self.pipe(final_prompt)[0]["generated_text"]
+        answer = llm_answer + f"\nИсточники:\n{sources}"
+        return OutputAnswer(answer=answer)
 
+    def close(self):
+        if self.weaviate_connection is not None:
+            self.weaviate_connection.close()
+            self.weaviate_connection = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
 rag_reader_app = RAGReader.bind()
-
-
-# ----- OpenAI-совместимый адаптер -----
 
 @serve.deployment
 @serve.ingress(app)
@@ -167,9 +204,9 @@ class OpenAIAdapter:
             "object": "list",
             "data": [
                 {
-                    "id": "qwen-wiki",
+                    "id": "wiki-searcher",
                     "object": "model",
-                    "owned_by": "custom",
+                    "owned_by": "OrionSoft",
                 }
             ],
         }
@@ -180,11 +217,11 @@ class OpenAIAdapter:
         body: Dict[str, Any] = await request.json()
         print("Тело", body)
 
-        model = body.get("model", "qwen-wiki")
+        model = body.get("model", "wiki-searcher")
         messages = body.get("messages", [])
-        nova_version = body.get("nova_version", "latest")
+        nova_version = str(body.get("nova_version", "latest"))
+        user_request = body.get("user_request", False)
 
-        # последний user message
         user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), {}
         )
@@ -192,19 +229,18 @@ class OpenAIAdapter:
 
         print(f"[OpenAIAdapter] model={model}, nova_version={nova_version}, query={query!r}")
 
-        # if model == "qwen-wiki" or "wiki" in model:
-        #     # вызываем wiki-question через Ray Serve handle
-        #     resp: OutputAnswer = await self.rag.make_context_prediction.remote(
-        #         InputQuestion(query=query)
-        #     )
-        # else:
-        #     resp: OutputAnswer = await self.rag.make_prediction.remote(
-        #         InputQuestion(query=query)
-        #     )
+        if user_request:
+            resp: OutputAnswer = await self.rag.make_context_prediction.remote(
+                InputRagQuestion(query=query, nova_version=nova_version)
+            )
+        else:
+            resp: OutputAnswer = await self.rag.make_prediction.remote(
+                InputQuestion(query=query)
+            )
 
-        #answer_text = resp.answer
-        answer_text = json.dumps(body, ensure_ascii=False, indent=2)
-        print(answer_text)
+        answer_text = resp.answer
+        #answer_text = json.dumps(body, ensure_ascii=False, indent=2)
+        #print(answer_text)
 
         return ChatCompletionResponse(
             id="chatcmpl-custom-1",
@@ -220,6 +256,5 @@ class OpenAIAdapter:
                 )
             ],
         )
-
-
+    
 openai_app = OpenAIAdapter.bind(rag_reader_app)
