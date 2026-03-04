@@ -3,14 +3,13 @@ import json
 from typing import List, Dict, Any
 
 import torch
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from ray import serve
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.config import Configure, Property, DataType
 from weaviate.classes.query import Filter
 
 MODEL_NAME = os.getenv(
@@ -116,7 +115,7 @@ class RAGReader:
             do_sample=True,
             temperature=0.2,
             repetition_penalty=1.1,
-            #return_full_text=False,
+            return_full_text=False,
             max_new_tokens=500,
         )
 
@@ -179,7 +178,7 @@ class RAGReader:
 
         llm_answer_init = self.pipe(final_prompt)
         print("Wiki answer:", llm_answer_init)
-        llm_answer = self.pipe(final_prompt)[0]["generated_text"]
+        llm_answer = llm_answer_init[0]["generated_text"]
         answer = llm_answer + f"\nИсточники:\n{sources}"
         return OutputAnswer(answer=answer)
 
@@ -217,7 +216,6 @@ class OpenAIAdapter:
 
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(self, request: Request):
-        print(request.json())
         body: Dict[str, Any] = await request.json()
         print("Тело", body)
 
