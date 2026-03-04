@@ -116,7 +116,7 @@ class RAGReader:
             do_sample=True,
             temperature=0.2,
             repetition_penalty=1.1,
-            return_full_text=False,
+            #return_full_text=False,
             max_new_tokens=500,
         )
 
@@ -153,6 +153,7 @@ class RAGReader:
             question=req.query
         )
         answer = self.pipe(final_prompt)
+        print("Generated answer for OpenWebUI request: ", answer)
         return OutputAnswer(answer=answer[0]["generated_text"])
 
     def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
@@ -160,7 +161,7 @@ class RAGReader:
 
         docs = self.nova_collection.query.hybrid(
             query=req.query,
-            limit=3,
+            limit=1,
             filters=Filter.by_property("version").equal(req.nova_version),
         )
 
@@ -171,6 +172,7 @@ class RAGReader:
         links = [obj.properties["source"] for obj in docs.objects]
         sources = "\n".join(links)
         context = "\n\n---\n\n".join(texts)
+        print("Found the following docs: ", context)
         final_prompt = self.internal_rag_promt_template.format(
             question=req.query, context=context
         )
