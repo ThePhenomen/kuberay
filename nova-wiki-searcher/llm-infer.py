@@ -101,7 +101,7 @@ app = FastAPI()
 
 @serve.deployment(
     num_replicas=1,
-    ray_actor_options={"num_cpus": 8},
+    ray_actor_options={"num_cpus": 8, "num_gpus": 1},
 )
 class RAGReader:
     def __init__(self):
@@ -144,7 +144,7 @@ class RAGReader:
             self.weaviate_connection.close()
             raise RuntimeError("Weaviate is not ready, aborting RAGReader initialization")
         
-        self.nova_collection = self.weavite_connection.collections.use(NOVA_COLLECTION_NAME)
+        self.nova_collection = self.weaviate_connection.collections.use(NOVA_COLLECTION_NAME)
 
     def make_prediction(self, req: InputQuestion) -> OutputAnswer:
         print("Got query:", req.query)
