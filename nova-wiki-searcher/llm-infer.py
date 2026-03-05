@@ -117,7 +117,7 @@ class RAGReader:
             temperature=0.2,
             repetition_penalty=1.1,
             return_full_text=False,
-            max_new_tokens=700,
+            max_new_tokens=1000,
         )
 
         self.internal_rag_promt_template = self.tokenizer.apply_chat_template(
@@ -161,7 +161,7 @@ class RAGReader:
 
         docs = self.nova_collection.query.hybrid(
             query=req.query,
-            limit=3,
+            limit=5,
             filters=Filter.by_property("version").equal(req.nova_version),
         )
 
