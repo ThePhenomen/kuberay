@@ -105,7 +105,7 @@ app = FastAPI()
 class RAGReader:
     def __init__(self):
         self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, torch_dtype=torch.float16, local_files_only=True, low_cpu_mem_usage=True, device_map="cuda"
+            MODEL_NAME, torch_dtype=torch.float16
         )
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         self.pipe = pipeline(
@@ -120,10 +120,10 @@ class RAGReader:
         )
 
         self.internal_rag_promt_template = self.tokenizer.apply_chat_template(
-            prompt_in_chat_format_for_rag, tokenize=False, add_generation_prompt=True
+            prompt_in_chat_format_for_rag, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
         self.internal_promt_template = self.tokenizer.apply_chat_template(
-            prompt_in_chat_format, tokenize=False, add_generation_prompt=True
+            prompt_in_chat_format, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
 
         try:
@@ -160,7 +160,7 @@ class RAGReader:
 
         docs = self.nova_collection.query.hybrid(
             query=req.query,
-            limit=1,
+            limit=3,
             filters=Filter.by_property("version").equal(req.nova_version),
         )
 
