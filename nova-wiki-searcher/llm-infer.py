@@ -105,7 +105,7 @@ app = FastAPI()
 class RAGReader:
     def __init__(self):
         self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, torch_dtype=torch.float16
+            MODEL_NAME, torch_dtype=torch.float16, local_files_only=True, low_cpu_mem_usage=True, device_map="cuda"
         )
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         self.pipe = pipeline(
