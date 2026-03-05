@@ -45,7 +45,8 @@ prompt_in_chat_format_for_rag = [
 give a comprehensive answer to the question.
 Respond only to the question asked, response should be concise and relevant to the question.
 Provide the number of the source document when relevant.
-If the answer cannot be deduced from the context, do not give an answer.""",
+If the answer cannot be deduced from the context, do not give an answer.
+Do not include direct sources in your response, I map them manually.""",
     },
     {
         "role": "user",
@@ -116,7 +117,7 @@ class RAGReader:
             temperature=0.2,
             repetition_penalty=1.1,
             return_full_text=False,
-            max_new_tokens=500,
+            max_new_tokens=700,
         )
 
         self.internal_rag_promt_template = self.tokenizer.apply_chat_template(
