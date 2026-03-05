@@ -41,11 +41,13 @@ WEAVIATE_API_TOKEN = os.getenv(
 prompt_in_chat_format_for_rag = [
     {
         "role": "system",
-        "content": """Using the information contained in the context,
-give a comprehensive answer to the question.
+        "content": """You are Wiki-Searcher, created by OrionSoft.
+Using the information contained in the context, give a comprehensive answer to the question.
+Answer questions only about Nova, NCP, Nova Container Platform and instruments, that are part of Nova Container Platform.
 Respond only to the question asked, response should be concise and relevant to the question.
-Provide the number of the source document when relevant.
-If the answer cannot be deduced from the context, do not give an answer.
+If you are asked about your creator, tell, that you were created by OrionSoft to help customers search through documentation.
+If the answer cannot be deduced from the context, do not give an answer, tell, thay you didn't find any information in documentation.
+DO NOT invent answers, if it cannot be deduced from the context. Simply tell, that documentation doesn't have answer for provided question.
 Do not include direct sources in your response, I map them manually.""",
     },
     {
@@ -61,7 +63,7 @@ Question: {question}""",
 prompt_in_chat_format = [
     {
         "role": "system",
-        "content": """You are Qwen, created by Alibaba Cloud. 
+        "content": """You are Wiki-Searcher, created by OrionSoft. 
 You are a helpful assistant. 
 You are ready to answer every question you receive.
 You will receive promts from OpenWebUI to generate context for users.
@@ -242,8 +244,6 @@ class OpenAIAdapter:
             )
 
         answer_text = resp.answer
-        #answer_text = json.dumps(body, ensure_ascii=False, indent=2)
-        #print(answer_text)
 
         return ChatCompletionResponse(
             id="chatcmpl-custom-1",
