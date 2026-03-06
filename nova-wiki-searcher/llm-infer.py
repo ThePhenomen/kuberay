@@ -76,12 +76,12 @@ Provide precise, concise answers directly addressing the user's prompt.""",
 ]
 
 class InputRagQuestion(BaseModel):
-    query: str
+    query: List[Dict[str, Any]]
     product_name: str
     product_version: str
 
 class InputQuestion(BaseModel):
-    query: str
+    query: List[Dict[str, Any]]
 
 class OutputAnswer(BaseModel):
     answer: str
