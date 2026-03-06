@@ -160,7 +160,7 @@ class RAGReader:
 
     def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
         print("Got wiki query:", req.query)
-
+        print("Searching for relevant documents")
         docs = self.nova_collection.query.hybrid(
             query=req.query,
             limit=7,
@@ -175,7 +175,7 @@ class RAGReader:
 
         if not docs.objects:
             return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
-
+        print(f"Found relevant documents: {len(docs)}")
         # texts = [obj.properties["page_content"] for obj in docs.objects]
         # links = [obj.properties["source"] for obj in docs.objects]
         # sources = "\n".join(links)
@@ -193,8 +193,8 @@ class RAGReader:
         )
 
         llm_answer_init = self.pipe(final_prompt)
-        llm_answer = llm_answer_init[0]["generated_text"]
-        answer = llm_answer + f"\nИсточники:\n{sources}"
+        answer = llm_answer_init[0]["generated_text"]
+        #answer = llm_answer + f"\nИсточники:\n{sources}"
         return OutputAnswer(answer=answer)
 
     def close(self):
