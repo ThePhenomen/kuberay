@@ -175,7 +175,7 @@ class RAGReader:
 
         if not docs.objects:
             return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
-        print(f"Found relevant documents: {len(docs)}")
+        print(f"Found relevant documents: {len(docs.objects)}")
         # texts = [obj.properties["page_content"] for obj in docs.objects]
         # links = [obj.properties["source"] for obj in docs.objects]
         # sources = "\n".join(links)
