@@ -41,14 +41,15 @@ WEAVIATE_API_TOKEN = os.getenv(
 prompt_in_chat_format_for_rag = [
     {
         "role": "system",
-        "content": """You are Wiki-Searcher, created by OrionSoft.
-Using the information contained in the context, give a comprehensive answer to the question.
-Answer questions only about Nova, NCP, Nova Container Platform and instruments, that are part of Nova Container Platform.
-Respond only to the question asked, response should be concise and relevant to the question.
-If you are asked about your creator, tell, that you were created by OrionSoft to help customers search through documentation.
-If the answer cannot be deduced from the context, do not give an answer, tell, thay you didn't find any information in documentation.
-DO NOT invent answers, if it cannot be deduced from the context. Simply tell, that documentation doesn't have answer for provided question.
-Do not include direct sources in your response, I map them manually.""",
+        "content": """You are Wiki-Searcher, a specialized AI assistant created by OrionSoft to help customers search through documentation.
+Your task is to answer user questions about Nova Container Platform (NCP) and its instruments, using ONLY the provided context.
+<rules>
+1. RELEVANCE: Answer ONLY questions related to Nova, NCP, and their components. If a question is entirely unrelated, politely decline to answer.
+2. STRICT GROUNDING: Base your answer EXCLUSIVELY on the information in the <context> block. Do not use outside knowledge.
+3. NO HALLUCINATIONS: If the context does not contain the answer, do not guess. Reply EXACTLY with: "I didn't find any information about this in the documentation."
+4. FORMAT: Be concise and direct. Include direct sources at the end of the sentences, where suitable. Provide a number of the sources and hyperlink to the url of this document.
+5. IDENTITY: If asked who created you, state you were created by OrionSoft to assist with documentation.
+</rules>""",
     },
     {
         "role": "user",
@@ -64,10 +65,8 @@ prompt_in_chat_format = [
     {
         "role": "system",
         "content": """You are Wiki-Searcher, created by OrionSoft. 
-You are a helpful assistant. 
-You are ready to answer every question you receive.
-You will receive promts from OpenWebUI to generate context for users.
-Answer very precisely only to provided questions""",
+Your task is to act as a helpful IT assistant specializing in OrionSoft products.
+Provide precise, concise answers directly addressing the user's prompt.""",
     },
     {
         "role": "user",
@@ -155,32 +154,30 @@ class RAGReader:
             question=req.query
         )
         answer = self.pipe(final_prompt)
-        print("Generated answer for OpenWebUI request: ", answer)
         return OutputAnswer(answer=answer[0]["generated_text"])
 
     def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
         print("Got wiki query:", req.query)
 
-        docs = self.nova_collection.query.hybrid(
-            query=req.query,
-            limit=5,
-            filters=Filter.by_property("version").equal(req.nova_version),
-        )
+        # docs = self.nova_collection.query.hybrid(
+        #     query=req.query,
+        #     limit=5,
+        #     filters=Filter.by_property("version").equal(req.nova_version),
+        # )
 
-        if not docs.objects:
-            return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
+        # if not docs.objects:
+        #     return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
 
-        texts = [obj.properties["page_content"] for obj in docs.objects]
-        links = [obj.properties["source"] for obj in docs.objects]
-        sources = "\n".join(links)
-        context = "\n\n---\n\n".join(texts)
-        print("Found the following docs: ", context)
+        # texts = [obj.properties["page_content"] for obj in docs.objects]
+        # links = [obj.properties["source"] for obj in docs.objects]
+        # sources = "\n".join(links)
+        # context = "\n\n---\n\n".join(texts)
+        context = "This is debug message. It is being provided for test reasons. Responde with: System is in test mode."
         final_prompt = self.internal_rag_promt_template.format(
             question=req.query, context=context
         )
 
         llm_answer_init = self.pipe(final_prompt)
-        print("Wiki answer:", llm_answer_init)
         llm_answer = llm_answer_init[0]["generated_text"]
         answer = llm_answer + f"\nИсточники:\n{sources}"
         return OutputAnswer(answer=answer)
@@ -224,6 +221,7 @@ class OpenAIAdapter:
 
         model = body.get("model", "wiki-searcher")
         messages = body.get("messages", [])
+        print("Messages:", messages)
         nova_version = str(body.get("nova_version", "latest"))
         user_request = body.get("user_request", False)
 
@@ -244,6 +242,8 @@ class OpenAIAdapter:
             )
 
         answer_text = resp.answer
+        #answer_text = json.dumps(body, ensure_ascii=False, indent=2)
+        #print(answer_text)
 
         return ChatCompletionResponse(
             id="chatcmpl-custom-1",
