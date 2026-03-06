@@ -160,15 +160,21 @@ class RAGReader:
 
     def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
         print("Got wiki query:", req.query)
+
         print("Searching for relevant documents")
+        user_contents_list = [m["content"] for m in req.query if m.get("role") == "user"]
+        user_contents = "\n".join(user_contents_list)
+        print(user_contents)
         docs = self.nova_collection.query.hybrid(
-            query=req.query,
-            limit=7,
+            query=user_contents,
+            limit=5,
             filters=(
                 Filter.any_of([
-                    Filter.by_property("version").equal(req.product_version),
+                    Filter.all_of([
+                        Filter.by_property("version").equal(req.product_version),
+                        Filter.by_property("product").equal(req.product_name),
+                    ]),
                     Filter.by_property("version").equal(req.product_name),
-                    Filter.by_property("product").equal(req.product_name),
                 ])
             ),
         )
@@ -241,20 +247,20 @@ class OpenAIAdapter:
         product_version = str(body.get("product_version", "latest"))
         user_request = body.get("user_request", False)
 
-        user_msg = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), {}
-        )
-        query = user_msg.get("content", "")
+        # user_msg = next(
+        #     (m for m in reversed(messages) if m.get("role") == "user"), {}
+        # )
+        # query = user_msg.get("content", "")
 
         print(f"[OpenAIAdapter] model={model}, product_name={product_name}, product_version={product_version}, query={messages}")
 
         if user_request:
             resp: OutputAnswer = await self.rag.make_context_prediction.remote(
-                InputRagQuestion(query=query, product_name=product_name, product_version=product_version)
+                InputRagQuestion(query=messages, product_name=product_name, product_version=product_version)
             )
         else:
             resp: OutputAnswer = await self.rag.make_prediction.remote(
-                InputQuestion(query=query)
+                InputQuestion(query=messages)
             )
 
         answer_text = resp.answer
