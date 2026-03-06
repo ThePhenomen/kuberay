@@ -44,11 +44,12 @@ prompt_in_chat_format_for_rag = [
         "content": """You are Wiki-Searcher, a specialized AI assistant created by OrionSoft to help customers search through documentation.
 Your task is to answer user questions about Nova Container Platform (NCP) and its instruments, using ONLY the provided context.
 <rules>
-1. RELEVANCE: Answer ONLY questions related to Nova, NCP, and their components. If a question is entirely unrelated, politely decline to answer.
-2. STRICT GROUNDING: Base your answer EXCLUSIVELY on the information in the <context> block. Do not use outside knowledge.
-3. NO HALLUCINATIONS: If the context does not contain the answer, do not guess. Reply EXACTLY with: "I didn't find any information about this in the documentation."
-4. FORMAT: Be concise and direct. Include direct sources at the end of the sentences, where suitable. Provide a number of the sources and hyperlink to the url of this document.
-5. IDENTITY: If asked who created you, state you were created by OrionSoft to assist with documentation.
+1. FORMAT: You will get the current conversation in chat format. Role 'user' stands for user questions, role 'assistant' stands for your previoues answer. You should answer last user question based on chat history and retrieved context.
+2. RELEVANCE: Answer ONLY questions related to Nova, NCP, and their components. If a question is entirely unrelated, politely decline to answer.
+3. STRICT GROUNDING: Base your answer EXCLUSIVELY on the information in the <context> block. Do not use outside knowledge.
+4. NO HALLUCINATIONS: If the context does not contain the answer, do not guess. Reply EXACTLY with: "I didn't find any information about this in the documentation."
+5. FORMAT: Be concise and direct. Include direct sources at the end of the sentences, where suitable. Provide a number of the sources and hyperlink to the url of this document.
+6. IDENTITY: If asked who created you, state you were created by OrionSoft to assist with documentation.
 </rules>""",
     },
     {
@@ -76,7 +77,8 @@ Provide precise, concise answers directly addressing the user's prompt.""",
 
 class InputRagQuestion(BaseModel):
     query: str
-    nova_version: str
+    product_name: str
+    product_version: str
 
 class InputQuestion(BaseModel):
     query: str
@@ -159,20 +161,33 @@ class RAGReader:
     def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
         print("Got wiki query:", req.query)
 
-        # docs = self.nova_collection.query.hybrid(
-        #     query=req.query,
-        #     limit=5,
-        #     filters=Filter.by_property("version").equal(req.nova_version),
-        # )
+        docs = self.nova_collection.query.hybrid(
+            query=req.query,
+            limit=7,
+            filters=(
+                Filter.any_of([
+                    Filter.by_property("version").equal(req.product_version),
+                    Filter.by_property("version").equal(req.product_name),
+                    Filter.by_property("product").equal(req.product_name),
+                ])
+            ),
+        )
 
-        # if not docs.objects:
-        #     return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
+        if not docs.objects:
+            return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
 
         # texts = [obj.properties["page_content"] for obj in docs.objects]
         # links = [obj.properties["source"] for obj in docs.objects]
         # sources = "\n".join(links)
         # context = "\n\n---\n\n".join(texts)
-        context = "This is debug message. It is being provided for test reasons. Responde with: System is in test mode."
+        texts_with_links = []
+        for obj in docs.objects:
+            text = obj.properties["page_content"]
+            link = obj.properties["source"]
+            text = f"{text}\n\nИсточник: {link}"
+            texts_with_links.append(text)
+        context = "\n\n---\n\n".join(texts_with_links)
+        #context = "This is debug message. It is being provided for test reasons. Responde with: System is in test mode."
         final_prompt = self.internal_rag_promt_template.format(
             question=req.query, context=context
         )
@@ -222,7 +237,8 @@ class OpenAIAdapter:
         model = body.get("model", "wiki-searcher")
         messages = body.get("messages", [])
         print("Messages:", messages)
-        nova_version = str(body.get("nova_version", "latest"))
+        product_name = str(body.get("product_name", "nova"))
+        product_version = str(body.get("product_version", "latest"))
         user_request = body.get("user_request", False)
 
         user_msg = next(
@@ -230,11 +246,11 @@ class OpenAIAdapter:
         )
         query = user_msg.get("content", "")
 
-        print(f"[OpenAIAdapter] model={model}, nova_version={nova_version}, query={query!r}")
+        print(f"[OpenAIAdapter] model={model}, product_name={product_name}, product_version={product_version}, query={messages}")
 
         if user_request:
             resp: OutputAnswer = await self.rag.make_context_prediction.remote(
-                InputRagQuestion(query=query, nova_version=nova_version)
+                InputRagQuestion(query=query, product_name=product_name, product_version=product_version)
             )
         else:
             resp: OutputAnswer = await self.rag.make_prediction.remote(
