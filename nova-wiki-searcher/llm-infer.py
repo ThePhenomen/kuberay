@@ -16,9 +16,9 @@ MODEL_NAME = os.getenv(
     "READER_MODEL_NAME",
     "Qwen/Qwen2.5-0.5B-Instruct",
 )
-NOVA_COLLECTION_NAME = os.getenv(
-    "NOVA_COLLECTION_NAME", 
-    "NovaWikiDocs"
+COLLECTION_NAME = os.getenv(
+    "COLLECTION_NAME", 
+    "WikiDocs"
 )
 WEAVIATE_GRPC_ADDR = os.getenv(
     "WEAVIATE_GRPC_ADDR", 
@@ -147,7 +147,7 @@ class RAGReader:
             self.weaviate_connection.close()
             raise RuntimeError("Weaviate is not ready, aborting RAGReader initialization")
         
-        self.nova_collection = self.weaviate_connection.collections.use(NOVA_COLLECTION_NAME)
+        self.nova_collection = self.weaviate_connection.collections.use(COLLECTION_NAME)
 
     def make_prediction(self, req: InputQuestion) -> OutputAnswer:
         print("Got query:", req.query)
