@@ -178,7 +178,13 @@ class RAGReader:
                         Filter.by_property("version").equal(req.product_version),
                         Filter.by_property("product").equal(req.product_name),
                     ]),
-                    Filter.by_property("version").equal(version),
+                    Filter.all_of([
+                        Filter.by_property("version").equal(version),
+                        Filter.any_of([
+                            Filter.by_property("source").like("*solutions*"),
+                            Filter.by_property("source").like("*knowledgebase*"),
+                        ]),
+                    ]),
                 ])
             ),
         )
