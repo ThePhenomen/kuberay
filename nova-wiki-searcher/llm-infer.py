@@ -164,7 +164,11 @@ class RAGReader:
         print("Searching for relevant documents")
         user_contents_list = [m["content"] for m in req.query if m.get("role") == "user"]
         user_contents = "\n".join(user_contents_list)
-        print(user_contents)
+        #print(user_contents)
+        if req.product_name == "zvirt":
+            version = "latest"
+        else:
+            version = req.product_name
         docs = self.nova_collection.query.hybrid(
             query=user_contents,
             limit=5,
@@ -174,7 +178,7 @@ class RAGReader:
                         Filter.by_property("version").equal(req.product_version),
                         Filter.by_property("product").equal(req.product_name),
                     ]),
-                    Filter.by_property("version").equal(req.product_name),
+                    Filter.by_property("version").equal(version),
                 ])
             ),
         )
