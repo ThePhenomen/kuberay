@@ -157,20 +157,40 @@ class RAGReader:
         )
         answer = self.pipe(final_prompt)
         return OutputAnswer(answer=answer[0]["generated_text"])
-
+    
     def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
         print("Got wiki query:", req.query)
 
-        print("Searching for relevant documents")
-        user_contents_list = [m["content"] for m in req.query if m.get("role") == "user"]
-        user_contents = "\n".join(user_contents_list)
-        #print(user_contents)
-        if req.product_name == "zvirt":
-            version = "latest"
+        last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
+        if len(req.query) <= 2: 
+            search_query = last_user_msg
         else:
-            version = req.product_name
+            history_msgs = req.query[-5:-1] 
+            history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_msgs])
+            rewrite_prompt_messages = [
+                {
+                    "role": "system",
+                    "content": "Ты — ИИ, оптимизирующий поисковые запросы. Проанализируй историю диалога и перепиши последний вопрос пользователя так, чтобы он стал самостоятельным и содержал все необходимые существительные (названия продуктов) вместо местоимений (он, это, туда). Верни ТОЛЬКО переформулированный вопрос, не отвечай на него."
+                },
+                {
+                    "role": "user",
+                    "content": f"История диалога:\n{history_text}\n\nПоследний вопрос: {last_user_msg}\n\nСамостоятельный поисковый запрос:"
+                }
+            ]
+            rewrite_prompt = self.tokenizer.apply_chat_template(
+                rewrite_prompt_messages, tokenize=False, add_generation_prompt=True
+            )
+            rewritten_result = self.pipe(rewrite_prompt, max_new_tokens=50, temperature=0.1)
+            search_query = rewritten_result[0]["generated_text"].strip()
+            print(f"Original query: {last_user_msg}")
+            print(f"Rewritten search query: {search_query}")
+
+        print("Searching for relevant documents using query:", search_query)
+        
+        version = "latest" if req.product_name == "zvirt" else req.product_name
         docs = self.nova_collection.query.hybrid(
-            query=user_contents,
+            query=search_query,
+            alpha=0.6,
             limit=5,
             filters=(
                 Filter.any_of([
@@ -191,27 +211,75 @@ class RAGReader:
 
         if not docs.objects:
             return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
-        print(f"Found relevant documents: {len(docs.objects)}")
-        # texts = [obj.properties["page_content"] for obj in docs.objects]
-        # links = [obj.properties["source"] for obj in docs.objects]
-        # sources = "\n".join(links)
-        # context = "\n\n---\n\n".join(texts)
+        
         texts_with_links = []
         for obj in docs.objects:
             text = obj.properties["page_content"]
             link = obj.properties["source"]
-            text = f"{text}\n\nИсточник: {link}"
-            texts_with_links.append(text)
+            texts_with_links.append(f"{text}\n\nИсточник: {link}")
         context = "\n\n---\n\n".join(texts_with_links)
-        #context = "This is debug message. It is being provided for test reasons. Responde with: System is in test mode."
+        
         final_prompt = self.internal_rag_promt_template.format(
             question=req.query, context=context
         )
-
         llm_answer_init = self.pipe(final_prompt)
-        answer = llm_answer_init[0]["generated_text"]
-        #answer = llm_answer + f"\nИсточники:\n{sources}"
-        return OutputAnswer(answer=answer)
+        return OutputAnswer(answer=llm_answer_init[0]["generated_text"])
+
+
+    # def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
+    #     print("Got wiki query:", req.query)
+
+    #     print("Searching for relevant documents")
+    #     user_contents_list = [m["content"] for m in req.query if m.get("role") == "user"]
+    #     user_contents = "\n".join(user_contents_list)
+    #     #print(user_contents)
+    #     if req.product_name == "zvirt":
+    #         version = "latest"
+    #     else:
+    #         version = req.product_name
+    #     docs = self.nova_collection.query.hybrid(
+    #         query=user_contents,
+    #         limit=5,
+    #         filters=(
+    #             Filter.any_of([
+    #                 Filter.all_of([
+    #                     Filter.by_property("version").equal(req.product_version),
+    #                     Filter.by_property("product").equal(req.product_name),
+    #                 ]),
+    #                 Filter.all_of([
+    #                     Filter.by_property("version").equal(version),
+    #                     Filter.any_of([
+    #                         Filter.by_property("source").like("*solutions*"),
+    #                         Filter.by_property("source").like("*knowledgebase*"),
+    #                     ]),
+    #                 ]),
+    #             ])
+    #         ),
+    #     )
+
+    #     if not docs.objects:
+    #         return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
+    #     print(f"Found relevant documents: {len(docs.objects)}")
+    #     # texts = [obj.properties["page_content"] for obj in docs.objects]
+    #     # links = [obj.properties["source"] for obj in docs.objects]
+    #     # sources = "\n".join(links)
+    #     # context = "\n\n---\n\n".join(texts)
+    #     texts_with_links = []
+    #     for obj in docs.objects:
+    #         text = obj.properties["page_content"]
+    #         link = obj.properties["source"]
+    #         text = f"{text}\n\nИсточник: {link}"
+    #         texts_with_links.append(text)
+    #     context = "\n\n---\n\n".join(texts_with_links)
+    #     #context = "This is debug message. It is being provided for test reasons. Responde with: System is in test mode."
+    #     final_prompt = self.internal_rag_promt_template.format(
+    #         question=req.query, context=context
+    #     )
+
+    #     llm_answer_init = self.pipe(final_prompt)
+    #     answer = llm_answer_init[0]["generated_text"]
+    #     #answer = llm_answer + f"\nИсточники:\n{sources}"
+    #     return OutputAnswer(answer=answer)
 
     def close(self):
         if self.weaviate_connection is not None:
