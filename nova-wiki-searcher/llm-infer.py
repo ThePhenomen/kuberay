@@ -109,18 +109,22 @@ app = FastAPI()
 class RAGReader:
     def __init__(self):
         self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, torch_dtype=torch.float16, local_files_only=True, low_cpu_mem_usage=True, device_map="cuda"
+            MODEL_NAME, torch_dtype="auto", local_files_only=True, low_cpu_mem_usage=True, device_map="cuda"
         )
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         self.pipe = pipeline(
             model=self.model,
             tokenizer=self.tokenizer,
             task="text-generation",
-            do_sample=True,
-            temperature=0.2,
+            #do_sample=True,
+            temperature=0.6,
             repetition_penalty=1.1,
-            return_full_text=False,
+            #return_full_text=False,
             max_new_tokens=1000,
+            use_cache=True,
+            top_p=0.95,
+            min_p=0,
+            top_k=20
         )
 
         self.internal_rag_promt_template = self.tokenizer.apply_chat_template(
