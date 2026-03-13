@@ -1,12 +1,20 @@
 import os
-import json
+import uuid
+import asyncio
 from typing import List, Dict, Any
 
-import torch
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from ray import serve
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+# Оставляем токенизатор для применения Chat Templates (vLLM может использовать его внутри, 
+# но для кастомных шаблонов надежнее держать отдельный инстанс)
+from transformers import AutoTokenizer
+
+# Импорты vLLM
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.sampling_params import SamplingParams
 
 import weaviate
 from weaviate.classes.init import Auth
@@ -14,29 +22,14 @@ from weaviate.classes.query import Filter
 
 MODEL_NAME = os.getenv(
     "READER_MODEL_NAME",
-    "Qwen/Qwen2.5-0.5B-Instruct",
+    "Qwen/Qwen2.5-0.5B-Instruct", # При запуске передайте ваш Qwen3-30B-A3B-Instruct-2507-FP8
 )
-COLLECTION_NAME = os.getenv(
-    "COLLECTION_NAME", 
-    "WikiDocs"
-)
-WEAVIATE_GRPC_ADDR = os.getenv(
-    "WEAVIATE_GRPC_ADDR", 
-    "weaviate-grpc.nova-weaviate.svc"
-)
-WEAVIATE_GRPC_PORT = int(os.getenv
-    ("WEAVIATE_GRPC_PORT", "50051"
-))
-WEAVIATE_HTTP_ADDR = os.getenv(
-    "WEAVIATE_HTTP_ADDR", 
-    "weaviate.nova-weaviate.svc"
-)
-WEAVIATE_HTTP_PORT = int(os.getenv(
-    "WEAVIATE_HTTP_PORT", "80"
-))
-WEAVIATE_API_TOKEN = os.getenv(
-    "WEAVIATE_API_TOKEN"
-)
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "WikiDocs")
+WEAVIATE_GRPC_ADDR = os.getenv("WEAVIATE_GRPC_ADDR", "weaviate-grpc.nova-weaviate.svc")
+WEAVIATE_GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
+WEAVIATE_HTTP_ADDR = os.getenv("WEAVIATE_HTTP_ADDR", "weaviate.nova-weaviate.svc")
+WEAVIATE_HTTP_PORT = int(os.getenv("WEAVIATE_HTTP_PORT", "80"))
+WEAVIATE_API_TOKEN = os.getenv("WEAVIATE_API_TOKEN")
 
 prompt_in_chat_format_for_rag = [
     {
@@ -100,6 +93,7 @@ class ChatCompletionResponse(BaseModel):
     object: str
     choices: List[ChatCompletionResponseChoice]
 
+
 app = FastAPI()
 
 @serve.deployment(
@@ -108,32 +102,27 @@ app = FastAPI()
 )
 class RAGReader:
     def __init__(self):
-        self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, torch_dtype="auto", local_files_only=True, low_cpu_mem_usage=True, device_map="cuda"
+        # 1. Инициализация vLLM Async Engine для H100
+        engine_args = AsyncEngineArgs(
+            model=MODEL_NAME,
+            tensor_parallel_size=1,        # 1 GPU (H100)
+            gpu_memory_utilization=0.9,    # Используем 90% VRAM под модель и KV Cache
+            max_model_len=8192,            # Ограничиваем максимальный контекст для стабильности
+            trust_remote_code=True,
+            # quantization="fp8",          # Раскомментируйте, если vLLM не определит FP8 автоматически
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        self.pipe = pipeline(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            task="text-generation",
-            #do_sample=True,
-            temperature=0.6,
-            repetition_penalty=1.1,
-            #return_full_text=False,
-            max_new_tokens=1000,
-            use_cache=True,
-            top_p=0.95,
-            min_p=0,
-            top_k=20
-        )
-
+        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+        
+        # 2. Инициализация токенизатора для Chat Templates
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
         self.internal_rag_promt_template = self.tokenizer.apply_chat_template(
-            prompt_in_chat_format_for_rag, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            prompt_in_chat_format_for_rag, tokenize=False, add_generation_prompt=True
         )
         self.internal_promt_template = self.tokenizer.apply_chat_template(
-            prompt_in_chat_format, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            prompt_in_chat_format, tokenize=False, add_generation_prompt=True
         )
 
+        # 3. Подключение к Weaviate
         try:
             self.weaviate_connection = weaviate.connect_to_custom(
                 http_host=WEAVIATE_HTTP_ADDR,
@@ -153,19 +142,34 @@ class RAGReader:
         
         self.nova_collection = self.weaviate_connection.collections.use(COLLECTION_NAME)
 
-    def make_prediction(self, req: InputQuestion) -> OutputAnswer:
-        print("Got query:", req.query)
+    # Вспомогательный асинхронный метод для генерации текста через vLLM
+    async def _generate_text(self, prompt: str, sampling_params: SamplingParams) -> str:
+        request_id = str(uuid.uuid4())
+        generator = self.engine.generate(prompt, sampling_params, request_id)
+        
+        final_output = None
+        async for request_output in generator:
+            final_output = request_output
+            
+        return final_output.outputs[0].text
 
-        final_prompt = self.internal_promt_template.format(
-            question=req.query
+    async def make_prediction(self, req: InputQuestion) -> OutputAnswer:
+        print("Got query:", req.query)
+        final_prompt = self.internal_promt_template.format(question=req.query)
+        
+        sampling_params = SamplingParams(
+            temperature=0.6, top_p=0.95, repetition_penalty=1.1, max_tokens=1000
         )
-        answer = self.pipe(final_prompt)
-        return OutputAnswer(answer=answer[0]["generated_text"])
+        
+        answer_text = await self._generate_text(final_prompt, sampling_params)
+        return OutputAnswer(answer=answer_text)
     
-    def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
+    async def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
         print("Got wiki query:", req.query)
 
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
+        
+        # --- 1. Query Rewriting (Асинхронно) ---
         if len(req.query) <= 2: 
             search_query = last_user_msg
         else:
@@ -184,40 +188,47 @@ class RAGReader:
             rewrite_prompt = self.tokenizer.apply_chat_template(
                 rewrite_prompt_messages, tokenize=False, add_generation_prompt=True
             )
-            rewritten_result = self.pipe(rewrite_prompt, max_new_tokens=50, temperature=0.1)
-            search_query = rewritten_result[0]["generated_text"].strip()
+            
+            rewrite_sampling = SamplingParams(temperature=0.1, max_tokens=50)
+            rewritten_result = await self._generate_text(rewrite_prompt, rewrite_sampling)
+            search_query = rewritten_result.strip()
+            
             print(f"Original query: {last_user_msg}")
             print(f"Rewritten search query: {search_query}")
 
         print("Searching for relevant documents using query:", search_query)
-        
         version = "latest" if req.product_name == "zvirt" else req.product_name
-        docs = self.nova_collection.query.hybrid(
-            query=search_query,
-            alpha=0.6,
-            limit=5,
-            filters=(
-                Filter.any_of([
-                    Filter.all_of([
-                        Filter.by_property("version").equal(req.product_version),
-                        Filter.by_property("product").equal(req.product_name),
-                    ]),
-                    Filter.all_of([
-                        Filter.by_property("version").equal(version),
-                        Filter.any_of([
-                            Filter.by_property("source").like("*solutions*"),
-                            Filter.by_property("source").like("*knowledgebase*"),
+        
+        # --- 2. Поиск в Weaviate (Выносим в отдельный поток, чтобы не блокировать Event Loop) ---
+        def fetch_docs():
+            return self.nova_collection.query.hybrid(
+                query=search_query,
+                alpha=0.6,
+                limit=5,
+                filters=(
+                    Filter.any_of([
+                        Filter.all_of([
+                            Filter.by_property("version").equal(req.product_version),
+                            Filter.by_property("product").equal(req.product_name),
                         ]),
-                    ]),
-                ])
-            ),
-        )
+                        Filter.all_of([
+                            Filter.by_property("version").equal(version),
+                            Filter.any_of([
+                                Filter.by_property("source").like("*solutions*"),
+                                Filter.by_property("source").like("*knowledgebase*"),
+                            ]),
+                        ]),
+                    ])
+                ),
+            )
 
+        docs = await asyncio.to_thread(fetch_docs)
         print("Finished looking for documents")
 
         if not docs.objects:
             return OutputAnswer(answer="No relevant docs found")
         
+        # --- 3. Подготовка контекста и финальная генерация (Асинхронно) ---
         texts_with_links = []
         for obj in docs.objects:
             text = obj.properties["page_content"]
@@ -228,68 +239,17 @@ class RAGReader:
         final_prompt = self.internal_rag_promt_template.format(
             question=req.query, context=context
         )
+        
         print("Generating answer")
-        llm_answer_init = self.pipe(final_prompt)
-        return OutputAnswer(answer=llm_answer_init[0]["generated_text"])
-
-
-    # def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
-    #     print("Got wiki query:", req.query)
-
-    #     print("Searching for relevant documents")
-    #     user_contents_list = [m["content"] for m in req.query if m.get("role") == "user"]
-    #     user_contents = "\n".join(user_contents_list)
-    #     #print(user_contents)
-    #     if req.product_name == "zvirt":
-    #         version = "latest"
-    #     else:
-    #         version = req.product_name
-    #     docs = self.nova_collection.query.hybrid(
-    #         query=user_contents,
-    #         limit=5,
-    #         filters=(
-    #             Filter.any_of([
-    #                 Filter.all_of([
-    #                     Filter.by_property("version").equal(req.product_version),
-    #                     Filter.by_property("product").equal(req.product_name),
-    #                 ]),
-    #                 Filter.all_of([
-    #                     Filter.by_property("version").equal(version),
-    #                     Filter.any_of([
-    #                         Filter.by_property("source").like("*solutions*"),
-    #                         Filter.by_property("source").like("*knowledgebase*"),
-    #                     ]),
-    #                 ]),
-    #             ])
-    #         ),
-    #     )
-
-    #     if not docs.objects:
-    #         return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
-    #     print(f"Found relevant documents: {len(docs.objects)}")
-    #     # texts = [obj.properties["page_content"] for obj in docs.objects]
-    #     # links = [obj.properties["source"] for obj in docs.objects]
-    #     # sources = "\n".join(links)
-    #     # context = "\n\n---\n\n".join(texts)
-    #     texts_with_links = []
-    #     for obj in docs.objects:
-    #         text = obj.properties["page_content"]
-    #         link = obj.properties["source"]
-    #         text = f"{text}\n\nИсточник: {link}"
-    #         texts_with_links.append(text)
-    #     context = "\n\n---\n\n".join(texts_with_links)
-    #     #context = "This is debug message. It is being provided for test reasons. Responde with: System is in test mode."
-    #     final_prompt = self.internal_rag_promt_template.format(
-    #         question=req.query, context=context
-    #     )
-
-    #     llm_answer_init = self.pipe(final_prompt)
-    #     answer = llm_answer_init[0]["generated_text"]
-    #     #answer = llm_answer + f"\nИсточники:\n{sources}"
-    #     return OutputAnswer(answer=answer)
+        final_sampling = SamplingParams(
+            temperature=0.6, top_p=0.95, repetition_penalty=1.1, max_tokens=1000
+        )
+        final_answer = await self._generate_text(final_prompt, final_sampling)
+        
+        return OutputAnswer(answer=final_answer)
 
     def close(self):
-        if self.weaviate_connection is not None:
+        if hasattr(self, 'weaviate_connection') and self.weaviate_connection is not None:
             self.weaviate_connection.close()
             self.weaviate_connection = None
 
@@ -298,6 +258,7 @@ class RAGReader:
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
+
 
 rag_reader_app = RAGReader.bind()
 
@@ -327,18 +288,13 @@ class OpenAIAdapter:
 
         model = body.get("model", "wiki-searcher")
         messages = body.get("messages", [])
-        print("Messages:", messages)
         product_name = str(body.get("product_name", "nova"))
         product_version = str(body.get("product_version", "latest"))
         user_request = body.get("user_request", False)
 
-        # user_msg = next(
-        #     (m for m in reversed(messages) if m.get("role") == "user"), {}
-        # )
-        # query = user_msg.get("content", "")
+        print(f"[OpenAIAdapter] model={model}, product_name={product_name}, product_version={product_version}")
 
-        print(f"[OpenAIAdapter] model={model}, product_name={product_name}, product_version={product_version}, query={messages}")
-
+        # Ray Serve корректно обрабатывает await для remote-вызовов
         if user_request:
             resp: OutputAnswer = await self.rag.make_context_prediction.remote(
                 InputRagQuestion(query=messages, product_name=product_name, product_version=product_version)
@@ -348,10 +304,6 @@ class OpenAIAdapter:
                 InputQuestion(query=messages)
             )
 
-        answer_text = resp.answer
-        #answer_text = json.dumps(body, ensure_ascii=False, indent=2)
-        #print(answer_text)
-
         return ChatCompletionResponse(
             id="chatcmpl-custom-1",
             object="chat.completion",
@@ -360,7 +312,7 @@ class OpenAIAdapter:
                     index=0,
                     message=ChatCompletionResponseChoiceMessage(
                         role="assistant",
-                        content=answer_text,
+                        content=resp.answer,
                     ),
                     finish_reason="stop",
                 )
