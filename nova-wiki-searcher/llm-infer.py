@@ -209,8 +209,10 @@ class RAGReader:
             ),
         )
 
+        print("Finished looking for documents")
+
         if not docs.objects:
-            return OutputAnswer(answer="Не нашёл релевантной документации для этого запроса.")
+            return OutputAnswer(answer="No relevant docs found")
         
         texts_with_links = []
         for obj in docs.objects:
@@ -222,6 +224,7 @@ class RAGReader:
         final_prompt = self.internal_rag_promt_template.format(
             question=req.query, context=context
         )
+        print("Generating answer")
         llm_answer_init = self.pipe(final_prompt)
         return OutputAnswer(answer=llm_answer_init[0]["generated_text"])
 
