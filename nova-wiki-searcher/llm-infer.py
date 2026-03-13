@@ -105,9 +105,9 @@ class RAGReader:
         # 1. Инициализация vLLM Async Engine для H100
         engine_args = AsyncEngineArgs(
             model=MODEL_NAME,
-            tensor_parallel_size=1,        # 1 GPU (H100)
+            #tensor_parallel_size=1,        # 1 GPU (H100)
             gpu_memory_utilization=0.9,    # Используем 90% VRAM под модель и KV Cache
-            max_model_len=8192,            # Ограничиваем максимальный контекст для стабильности
+            #max_model_len=8192,            # Ограничиваем максимальный контекст для стабильности
             trust_remote_code=True,
             # quantization="fp8",          # Раскомментируйте, если vLLM не определит FP8 автоматически
         )
