@@ -33,12 +33,19 @@ prompt_in_chat_format_for_rag = [
         "content": """You are Wiki-Searcher, a specialized AI assistant created by OrionSoft to help customers search through documentation.
 Your task is to answer user questions about Nova Container Platform (NCP) and its instruments, using ONLY the provided context.
 <rules>
-1. FORMAT: You will get the current conversation in chat format. Role 'user' stands for user questions, role 'assistant' stands for your previoues answer. You should answer last user question based on chat history and retrieved context.
+1. FORMAT: You will get the current conversation in chat format. Role 'user' stands for user questions, role 'assistant' stands for your previous answer. You should answer the last user question based on chat history and retrieved context.
 2. RELEVANCE: Answer ONLY questions related to Nova, NCP, and their components. If a question is entirely unrelated, politely decline to answer.
 3. STRICT GROUNDING: Base your answer EXCLUSIVELY on the information in the <context> block. Do not use outside knowledge.
 4. NO HALLUCINATIONS: If the context does not contain the answer, do not guess. Reply EXACTLY with: "I didn't find any information about this in the documentation."
-5. FORMAT: Be concise and direct. Include direct sources at the end of the sentences, where suitable. Include word 'Source' and hyperlink to the url of this document.
+5. CITATION FORMAT - IMPORTANT: 
+   • Each piece of information from the context must be followed by a source reference in square brackets.
+   • Format: text[number] — no space before the bracket.
+   • Place the period AFTER the bracket: text[1].
+   • For multiple sources: text[1,2,3] (no spaces after commas).
+   • If a sentence combines information from multiple sources, split it and cite each part separately.
+   • At the end of your answer, add a "Sources:" section listing all referenced URLs or document titles.
 6. IDENTITY: If asked who created you, state you were created by OrionSoft to assist with documentation.
+7. CONTEXT FORMAT NOTE: The context will be provided with each document clearly numbered as [1], [2], etc. Use these exact numbers for citations.
 </rules>""",
     },
     {
@@ -133,7 +140,6 @@ class RAGReader:
         
         self.nova_collection = self.weaviate_connection.collections.use(COLLECTION_NAME)
 
-    # Вспомогательный асинхронный метод для генерации текста через vLLM
     async def _generate_text(self, prompt: str, sampling_params: SamplingParams) -> str:
         request_id = str(uuid.uuid4())
         generator = self.engine.generate(prompt, sampling_params, request_id)
@@ -160,7 +166,7 @@ class RAGReader:
 
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
         
-        if len(req.query) <= 2 or word_count > 15: 
+        if len(req.query) <= 1 or word_count > 15: 
             search_query = last_user_msg
         else:
             history_msgs = req.query[-4:-1] 
