@@ -7,11 +7,7 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from ray import serve
 
-# Оставляем токенизатор для применения Chat Templates (vLLM может использовать его внутри, 
-# но для кастомных шаблонов надежнее держать отдельный инстанс)
 from transformers import AutoTokenizer
-
-# Импорты vLLM
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
@@ -22,7 +18,7 @@ from weaviate.classes.query import Filter
 
 MODEL_NAME = os.getenv(
     "READER_MODEL_NAME",
-    "Qwen/Qwen2.5-0.5B-Instruct", # При запуске передайте ваш Qwen3-30B-A3B-Instruct-2507-FP8
+    "Qwen/Qwen2.5-0.5B-Instruct",
 )
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "WikiDocs")
 WEAVIATE_GRPC_ADDR = os.getenv("WEAVIATE_GRPC_ADDR", "weaviate-grpc.nova-weaviate.svc")
@@ -93,7 +89,6 @@ class ChatCompletionResponse(BaseModel):
     object: str
     choices: List[ChatCompletionResponseChoice]
 
-
 app = FastAPI()
 
 @serve.deployment(
@@ -102,18 +97,15 @@ app = FastAPI()
 )
 class RAGReader:
     def __init__(self):
-        # 1. Инициализация vLLM Async Engine для H100
         engine_args = AsyncEngineArgs(
             model=MODEL_NAME,
-            #tensor_parallel_size=1,        # 1 GPU (H100)
-            gpu_memory_utilization=0.9,    # Используем 90% VRAM под модель и KV Cache
-            #max_model_len=8192,            # Ограничиваем максимальный контекст для стабильности
+            #tensor_parallel_size=1,
+            gpu_memory_utilization=0.95,
+            #max_model_len=8192,
             trust_remote_code=True,
-            # quantization="fp8",          # Раскомментируйте, если vLLM не определит FP8 автоматически
+            # quantization="fp8",
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-        
-        # 2. Инициализация токенизатора для Chat Templates
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
         self.internal_rag_promt_template = self.tokenizer.apply_chat_template(
             prompt_in_chat_format_for_rag, tokenize=False, add_generation_prompt=True
@@ -122,7 +114,6 @@ class RAGReader:
             prompt_in_chat_format, tokenize=False, add_generation_prompt=True
         )
 
-        # 3. Подключение к Weaviate
         try:
             self.weaviate_connection = weaviate.connect_to_custom(
                 http_host=WEAVIATE_HTTP_ADDR,
@@ -169,37 +160,43 @@ class RAGReader:
 
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
         
-        # --- 1. Query Rewriting (Асинхронно) ---
-        if len(req.query) <= 2: 
+        if len(req.query) <= 2 or word_count > 15: 
             search_query = last_user_msg
         else:
-            history_msgs = req.query[-5:-1] 
+            history_msgs = req.query[-4:-1] 
             history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_msgs])
             rewrite_prompt_messages = [
                 {
                     "role": "system",
-                    "content": "Ты — ИИ, оптимизирующий поисковые запросы. Проанализируй историю диалога и перепиши последний вопрос пользователя так, чтобы он стал самостоятельным и содержал все необходимые существительные (названия продуктов) вместо местоимений (он, это, туда). Верни ТОЛЬКО переформулированный вопрос, не отвечай на него."
+                    "content": (
+                        "You are a search query transformation system. Your task is to formulate a text for documentation search.\n"
+                        "Rules:\n"
+                        "1. Analyze the user's latest question. If it contains pronouns (he, it, this, there) or "
+                        "logically continues the previous topic, rewrite it by adding specifics from the conversation history.\n"
+                        "2. IMPORTANT: If the latest question starts a COMPLETELY NEW TOPIC unrelated to the history, "
+                        "SIMPLY RETURN the latest question as is. Do not drag in terms from the old topic!\n"
+                        "3. Output ONLY the final query text without quotes, explanations, or greetings. Do not answer the question itself."
+                    )
                 },
                 {
                     "role": "user",
-                    "content": f"История диалога:\n{history_text}\n\nПоследний вопрос: {last_user_msg}\n\nСамостоятельный поисковый запрос:"
+                    "content": f"Conversation history:\n{history_text}\n\nLatest question: {last_user_msg}\n\nFinal search query:"
                 }
             ]
             rewrite_prompt = self.tokenizer.apply_chat_template(
                 rewrite_prompt_messages, tokenize=False, add_generation_prompt=True
             )
             
-            rewrite_sampling = SamplingParams(temperature=0.1, max_tokens=50)
+            rewrite_sampling = SamplingParams(temperature=0.0, max_tokens=50)
             rewritten_result = await self._generate_text(rewrite_prompt, rewrite_sampling)
             search_query = rewritten_result.strip()
             
             print(f"Original query: {last_user_msg}")
-            print(f"Rewritten search query: {search_query}")
+            print(f"Rewritten query: {search_query}")
 
         print("Searching for relevant documents using query:", search_query)
         version = "latest" if req.product_name == "zvirt" else req.product_name
         
-        # --- 2. Поиск в Weaviate (Выносим в отдельный поток, чтобы не блокировать Event Loop) ---
         def fetch_docs():
             return self.nova_collection.query.hybrid(
                 query=search_query,
@@ -228,7 +225,6 @@ class RAGReader:
         if not docs.objects:
             return OutputAnswer(answer="No relevant docs found")
         
-        # --- 3. Подготовка контекста и финальная генерация (Асинхронно) ---
         texts_with_links = []
         for obj in docs.objects:
             text = obj.properties["page_content"]
@@ -294,7 +290,6 @@ class OpenAIAdapter:
 
         print(f"[OpenAIAdapter] model={model}, product_name={product_name}, product_version={product_version}")
 
-        # Ray Serve корректно обрабатывает await для remote-вызовов
         if user_request:
             resp: OutputAnswer = await self.rag.make_context_prediction.remote(
                 InputRagQuestion(query=messages, product_name=product_name, product_version=product_version)
