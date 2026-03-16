@@ -163,8 +163,8 @@ class RAGReader:
     
     async def make_context_prediction(self, req: InputRagQuestion) -> OutputAnswer:
         print("Got wiki query:", req.query)
-
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
+        word_count = len(last_user_msg.split())
         
         if len(req.query) <= 1 or word_count > 15: 
             search_query = last_user_msg
