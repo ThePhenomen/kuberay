@@ -47,6 +47,8 @@ Your task is to answer user questions about products, invented in OrionSoft, and
    Do NOT treat these as documentation queries and do NOT include Sources section for such responses.
 5. SELF-CONFIGURATION QUESTIONS:
    - If the user asks about you as an assistant (for example: your timeout, speed, limits, how you work, where you get answers from, who created you), you MAY answer using your general description and these rules, even if the documentation context does not contain this information.
+   - When the user asks where you get your answers from, ALWAYS answer that you use internal documentation of OrionSoft products (for example: "Я использую внутреннюю документацию продуктов OrionSoft, такую как руководства, инструкции по установке и эксплуатации.").
+   - Do NOT mention the word "context" or "<context>" in such answers. Speak only about documentation of OrionSoft in general terms.
    - For such questions, do NOT try to invent technical implementation details (exact hardware, IP addresses, internal service names). Answer in general terms, e.g. "У меня нет доступа к настройкам таймаутов. Этим управляют администраторы системы."
    - For these meta/self-configuration questions DO NOT use the context for facts and DO NOT add any "Sources:" section.
 6. IDENTITY: If asked who created you, state you were created by OrionSoft to assist with documentation.
@@ -54,7 +56,7 @@ Your task is to answer user questions about products, invented in OrionSoft, and
    - If the user asks about product behavior, configuration, installation, troubleshooting, or any other documentation-related topic, and you use the <context> block to answer, then at the end of your answer add a "Sources:" section listing all referenced URLs or document titles.
    - Do NOT add a "Sources:" section for meta-questions, greetings, thanks, chitchat, or questions about where you get your answers from.
 8. ANSWER LENGTH: 
-    - Generate MAXIMUM 1000 tokens. 
+    - Generate MAXIMUM 1000 tokens or 600-800 words. 
     - If the answer is long, prioritize the most important points and omit minor details. Otherwise, all other tokens will be truncated.
 9. LANGUAGE: Use Russian for conversation. 
 </rules>""",
@@ -164,11 +166,10 @@ class RAGReader:
         return final_output.outputs[0].text
 
     async def make_prediction(self, req: InputQuestion) -> OutputAnswer:
-        print("Got query:", req.query)
         final_prompt = self.internal_promt_template.format(question=req.query)
         
         sampling_params = SamplingParams(
-            temperature=0.6, top_p=0.95, repetition_penalty=1.1, max_tokens=1000
+            temperature=0.6, top_p=0.95, repetition_penalty=1.1, max_tokens=200
         )
         
         answer_text = await self._generate_text(final_prompt, sampling_params)
@@ -257,7 +258,7 @@ class RAGReader:
         
         print("Generating answer")
         final_sampling = SamplingParams(
-            temperature=0.6, top_p=0.95, repetition_penalty=1.1, max_tokens=1000
+            temperature=0.6, top_p=0.95, repetition_penalty=1.1, max_tokens=1200
         )
         final_answer = await self._generate_text(final_prompt, final_sampling)
         
