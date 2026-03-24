@@ -127,14 +127,13 @@ class Reranker:
     def __init__(self):
         print(f"Loading reranker model: {RERANKER_MODEL_ID}")
         self.tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_ID, trust_remote_code=True)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = AutoModelForSequenceClassification.from_pretrained(
             RERANKER_MODEL_ID,
             trust_remote_code=True,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.float16,
             local_files_only=True,
             device_map="cuda",
-        ).to(device)
+        )
         self.model.eval()
 
     async def rerank(self, query: str, docs: List[Dict[str, str]], top_k: int = 8) -> List[Dict[str, str]]:
@@ -150,7 +149,6 @@ class Reranker:
             pairs.append([query, snippet])
 
         device = next(self.model.parameters()).device
-
 
         print("Start reranking")
         with torch.no_grad():
