@@ -14,7 +14,7 @@ from vllm.sampling_params import SamplingParams
 
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.query import Filter
+from weaviate.classes.query import Filter, MetadataQuery
 
 MODEL_NAME = os.getenv(
     "READER_MODEL_NAME",
@@ -56,7 +56,7 @@ Your task is to answer user questions about products, invented in OrionSoft, and
    - If the user asks about product behavior, configuration, installation, troubleshooting, or any other documentation-related topic, and you use the <context> block to answer, then at the end of your answer add a "Sources:" section listing all referenced URLs or document titles.
    - Do NOT add a "Sources:" section for meta-questions, greetings, thanks, chitchat, or questions about where you get your answers from.
 8. ANSWER LENGTH: 
-    - Generate MAXIMUM 1000 tokens or 600-800 words. 
+    - Generate at most 800 words. 
     - If the answer is long, prioritize the most important points and omit minor details. Otherwise, all other tokens will be truncated.
 9. LANGUAGE: Use Russian for conversation. 
 </rules>""",
@@ -125,6 +125,7 @@ class RAGReader:
             gpu_memory_utilization=0.95,
             #max_model_len=8192,
             trust_remote_code=True,
+            enable_chunked_prefill=True,
             # quantization="fp8",
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -153,7 +154,10 @@ class RAGReader:
             self.weaviate_connection.close()
             raise RuntimeError("Weaviate is not ready, aborting RAGReader initialization")
         
-        self.nova_collection = self.weaviate_connection.collections.use(COLLECTION_NAME)
+        self.nova_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}{'nova'.capitalize()}")
+        self.zvirt_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}{'zvirt'.capitalize()}")
+        self.knowledgebase_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}{'knowledgebase'.capitalize()}")
+        self.solutions_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}{'solutions'.capitalize()}")
 
     async def _generate_text(self, prompt: str, sampling_params: SamplingParams) -> str:
         request_id = str(uuid.uuid4())
@@ -169,7 +173,7 @@ class RAGReader:
         final_prompt = self.internal_promt_template.format(question=req.query)
         
         sampling_params = SamplingParams(
-            temperature=0.6, top_p=0.95, repetition_penalty=1.1, max_tokens=200
+            temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=200
         )
         
         answer_text = await self._generate_text(final_prompt, sampling_params)
@@ -214,30 +218,52 @@ class RAGReader:
             print(f"Original query: {last_user_msg}")
             print(f"Rewritten query: {search_query}")
 
-        print("Searching for relevant documents using query:", search_query)
-        version = "latest" if req.product_name == "zvirt" else req.product_name
+        match req.product_name:
+            case "zvirt":
+                collection = self.zvirt_collection
+                version = req.product_name
+            case "nova":
+                collection = self.nova_collection
+                version = "latest"
+            case _:
+                collection = self.nova_collection
+                version = "latest"
         
         def fetch_docs():
-            return self.nova_collection.query.hybrid(
+            res_main = collection.query.hybrid(
                 query=search_query,
-                alpha=0.4,
+                alpha=0.3,
                 limit=5,
-                filters=(
-                    Filter.any_of([
-                        Filter.all_of([
-                            Filter.by_property("version").equal(req.product_version),
-                            Filter.by_property("product").equal(req.product_name),
-                        ]),
-                        Filter.all_of([
-                            Filter.by_property("version").equal(version),
-                            Filter.any_of([
-                                Filter.by_property("source").like("*solutions*"),
-                                Filter.by_property("source").like("*knowledgebase*"),
-                            ]),
-                        ]),
-                    ])
-                ),
+                filters=Filter.by_property("version").equal(req.product_version),
+                return_metadata=MetadataQuery(score=True),
             )
+            res_knowledgebase = self.knowledgebase_collection.query.hybrid(
+                query=search_query,
+                alpha=0.3,
+                limit=3,
+                filters=Filter.by_property("version").equal(version),
+                return_metadata=MetadataQuery(score=True),
+            )
+            res_solutions = self.solutions_collection.query.hybrid(
+                query=search_query,
+                alpha=0.3,
+                limit=3,
+                filters=Filter.by_property("version").equal(version),
+                return_metadata=MetadataQuery(score=True),
+            )
+
+            combined = []
+            for res in (res_main, res_knowledgebase, res_solutions):
+                for obj in res.objects or []:
+                    combined.append(obj)
+
+            combined.sort(key=lambda o: (o.metadata.score or 0.0), reverse=True)
+
+            class CombinedResult:
+                def __init__(self, objects):
+                    self.objects = objects
+
+            return CombinedResult(objects=combined[:8])
 
         docs = await asyncio.to_thread(fetch_docs)
         print("Finished looking for documents")
@@ -248,7 +274,7 @@ class RAGReader:
         texts_with_links = []
         for obj in docs.objects:
             text = obj.properties["page_content"]
-            link = obj.properties["source"]
+            link = obj.properties["page_url"]
             texts_with_links.append(f"{text}\n\nИсточник: {link}")
         context = "\n\n---\n\n".join(texts_with_links)
         
@@ -258,7 +284,7 @@ class RAGReader:
         
         print("Generating answer")
         final_sampling = SamplingParams(
-            temperature=0.6, top_p=0.95, repetition_penalty=1.1, max_tokens=1200
+            temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=1200
         )
         final_answer = await self._generate_text(final_prompt, final_sampling)
         
