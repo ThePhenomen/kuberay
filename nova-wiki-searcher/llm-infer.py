@@ -3,11 +3,12 @@ import uuid
 import asyncio
 from typing import List, Dict, Any
 
+import torch
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from ray import serve
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
@@ -19,6 +20,10 @@ from weaviate.classes.query import Filter, MetadataQuery
 MODEL_NAME = os.getenv(
     "READER_MODEL_NAME",
     "Qwen/Qwen2.5-0.5B-Instruct",
+)
+RERANKER_MODEL_ID = os.getenv(
+    "RERANKER_MODEL_ID", 
+    "Alibaba-NLP/gte-multilingual-reranker-base"
 )
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "WikiDocs")
 WEAVIATE_GRPC_ADDR = os.getenv("WEAVIATE_GRPC_ADDR", "weaviate-grpc.nova-weaviate.svc")
@@ -111,18 +116,72 @@ class ChatCompletionResponse(BaseModel):
     object: str
     choices: List[ChatCompletionResponseChoice]
 
+
 app = FastAPI()
 
 @serve.deployment(
     num_replicas=1,
-    ray_actor_options={"num_cpus": 8, "num_gpus": 1},
+    ray_actor_options={"num_cpus": 4, "num_gpus": 0.1},
+)
+class Reranker:
+    def __init__(self):
+        print(f"Loading reranker model: {RERANKER_MODEL_ID}")
+        self.tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_ID, trust_remote_code=True)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            RERANKER_MODEL_ID,
+            trust_remote_code=True,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        ).to(device)
+        self.model.eval()
+
+    async def rerank(self, query: str, docs: List[Dict[str, str]], top_k: int = 8) -> List[Dict[str, str]]:
+        if not docs:
+            return []
+            
+        print("Init reranking")
+        pairs = []
+        for doc in docs:
+            title = doc.get("title", "")
+            content = doc.get("page_content", "")
+            snippet = f"{title}\n\n{content[:1500]}"
+            pairs.append([query, snippet])
+
+        device = next(self.model.parameters()).device
+
+
+        print("Start reranking")
+        with torch.no_grad():
+            inputs = self.tokenizer(
+                pairs,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            ).to(device)
+            
+            scores = self.model(**inputs, return_dict=True).logits.view(-1).float().tolist()
+        
+        print(f"Output scores: {scores}")
+
+        scored_docs = list(zip(docs, scores))
+        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        print(f"Output docs with scores: {scored_docs}")
+        
+        return [doc for doc, score in scored_docs[:top_k]]
+
+@serve.deployment(
+    num_replicas=1,
+    ray_actor_options={"num_cpus": 10, "num_gpus": 0.9},
 )
 class RAGReader:
-    def __init__(self):
+    def __init__(self, reranker_handle):
+        self.reranker = reranker_handle
+        
         engine_args = AsyncEngineArgs(
             model=MODEL_NAME,
             #tensor_parallel_size=1,
-            gpu_memory_utilization=0.95,
+            gpu_memory_utilization=0.85,
             #max_model_len=8192,
             trust_remote_code=True,
             enable_chunked_prefill=True,
@@ -229,52 +288,54 @@ class RAGReader:
                 collection = self.nova_collection
                 version = "latest"
         
-        def fetch_docs():
+        def fetch_docs() -> List[Dict[str, str]]:
             res_main = collection.query.hybrid(
                 query=search_query,
                 alpha=0.3,
-                limit=5,
+                limit=10, 
                 filters=Filter.by_property("version").equal(req.product_version),
                 return_metadata=MetadataQuery(score=True),
             )
             res_knowledgebase = self.knowledgebase_collection.query.hybrid(
                 query=search_query,
                 alpha=0.3,
-                limit=3,
+                limit=5,
                 filters=Filter.by_property("version").equal(version),
                 return_metadata=MetadataQuery(score=True),
             )
             res_solutions = self.solutions_collection.query.hybrid(
                 query=search_query,
                 alpha=0.3,
-                limit=3,
+                limit=5,
                 filters=Filter.by_property("version").equal(version),
                 return_metadata=MetadataQuery(score=True),
             )
 
-            combined = []
+            raw_objects = []
             for res in (res_main, res_knowledgebase, res_solutions):
                 for obj in res.objects or []:
-                    combined.append(obj)
+                    raw_objects.append({
+                        "title": obj.properties.get("title", ""),
+                        "page_content": obj.properties.get("page_content", ""),
+                        "page_url": obj.properties.get("page_url", ""),
+                        "hybrid_score": obj.metadata.score or 0.0
+                    })
 
-            combined.sort(key=lambda o: (o.metadata.score or 0.0), reverse=True)
+            return raw_objects
 
-            class CombinedResult:
-                def __init__(self, objects):
-                    self.objects = objects
+        raw_docs = await asyncio.to_thread(fetch_docs)
+        print(f"Retrieved {len(raw_docs)} documents from Weaviate")
 
-            return CombinedResult(objects=combined[:8])
-
-        docs = await asyncio.to_thread(fetch_docs)
-        print("Finished looking for documents")
-
-        if not docs.objects:
+        if not raw_docs:
             return OutputAnswer(answer="No relevant docs found")
+            
+        reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=8)
+        print("Finished reranking documents")
         
         texts_with_links = []
-        for obj in docs.objects:
-            text = obj.properties["page_content"]
-            link = obj.properties["page_url"]
+        for doc in reranked_docs:
+            text = doc["page_content"]
+            link = doc["page_url"]
             texts_with_links.append(f"{text}\n\nИсточник: {link}")
         context = "\n\n---\n\n".join(texts_with_links)
         
@@ -301,10 +362,13 @@ class RAGReader:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
+reranker_app = Reranker.bind()
+rag_reader_app = RAGReader.bind(reranker_app)
 
-rag_reader_app = RAGReader.bind()
-
-@serve.deployment
+@serve.deployment(
+    num_replicas=1,
+    ray_actor_options={"num_cpus": 1, "num_gpus": 0},
+)
 @serve.ingress(app)
 class OpenAIAdapter:
     def __init__(self, rag_handle):
@@ -326,8 +390,7 @@ class OpenAIAdapter:
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(self, request: Request):
         body: Dict[str, Any] = await request.json()
-        #print("Тело", body)
-
+        
         model = body.get("model", "wiki-searcher")
         messages = body.get("messages", [])
         product_name = str(body.get("product_name", "nova"))
