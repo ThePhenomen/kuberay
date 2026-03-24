@@ -131,7 +131,6 @@ class Reranker:
             RERANKER_MODEL_ID,
             trust_remote_code=True,
             torch_dtype=torch.float16,
-            local_files_only=True,
             device_map="cuda",
         )
         self.model.eval()
