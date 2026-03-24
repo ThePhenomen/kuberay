@@ -2,6 +2,7 @@ import os
 import uuid
 import asyncio
 from typing import List, Dict, Any
+import math
 
 import torch
 from fastapi import FastAPI, Request
@@ -135,7 +136,13 @@ class Reranker:
         )
         self.model.eval()
 
-    async def rerank(self, query: str, docs: List[Dict[str, str]], top_k: int = 8) -> List[Dict[str, str]]:
+    async def rerank(
+        self,
+        query: str,
+        docs: List[Dict[str, str]],
+        top_k: int = 8,
+        alpha: float = 0.5,
+    ) -> List[Dict[str, str]]:
         if not docs:
             return []
             
@@ -159,15 +166,55 @@ class Reranker:
                 return_tensors="pt",
             ).to(device)
             
-            scores = self.model(**inputs, return_dict=True).logits.view(-1).float().tolist()
-        
-        print(f"Output scores: {scores}")
+            rerank_scores = (
+                self.model(**inputs, return_dict=True)
+                .logits.view(-1)
+                .float()
+                .tolist()
+            )
 
-        scored_docs = list(zip(docs, scores))
-        scored_docs.sort(key=lambda x: x[1], reverse=True)
-        print(f"Output docs with scores: {scored_docs[:top_k]}")
-        
-        return [doc for doc, score in scored_docs[:top_k]]
+        print(f"Raw rerank scores: {rerank_scores}")
+
+        hybrid_scores = [float(doc.get("hybrid_score", 0.0)) for doc in docs]
+        eps = 1e-8
+
+        def minmax_norm(values: List[float]) -> List[float]:
+            v_min = min(values)
+            v_max = max(values)
+            if math.isclose(v_min, v_max):
+                return [0.5 for _ in values]
+            return [(v - v_min) / (v_max - v_min + eps) for v in values]
+
+        hybrid_norm = minmax_norm(hybrid_scores)
+        rerank_norm = minmax_norm(rerank_scores)
+
+        scored_docs = []
+        for doc, h_raw, h_n, r_raw, r_n in zip(
+            docs, hybrid_scores, hybrid_norm, rerank_scores, rerank_norm
+        ):
+            combined = alpha * r_n + (1.0 - alpha) * h_n
+            doc["hybrid_score_raw"] = h_raw
+            doc["rerank_score_raw"] = r_raw
+            doc["hybrid_score_norm"] = h_n
+            doc["rerank_score_norm"] = r_n
+            doc["combined_score"] = combined
+            scored_docs.append(doc)
+
+        scored_docs.sort(key=lambda d: d["combined_score"], reverse=True)
+
+        print("Top docs (combined):", [
+            (
+                d.get("page_url"),
+                d["hybrid_score_raw"],
+                d["rerank_score_raw"],
+                d["hybrid_score_norm"],
+                d["rerank_score_norm"],
+                d["combined_score"],
+            )
+            for d in scored_docs[:top_k]
+        ])
+
+        return scored_docs[:top_k]
 
 @serve.deployment(
     num_replicas=1,
