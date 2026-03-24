@@ -165,7 +165,7 @@ class Reranker:
 
         scored_docs = list(zip(docs, scores))
         scored_docs.sort(key=lambda x: x[1], reverse=True)
-        print(f"Output docs with scores: {scored_docs}")
+        print(f"Output docs with scores: {scored_docs[:top_k]}")
         
         return [doc for doc, score in scored_docs[:top_k]]
 
@@ -279,13 +279,13 @@ class RAGReader:
         match req.product_name:
             case "zvirt":
                 collection = self.zvirt_collection
-                version = req.product_name
+                version = "latest"
             case "nova":
                 collection = self.nova_collection
-                version = "latest"
+                version = req.product_name
             case _:
                 collection = self.nova_collection
-                version = "latest"
+                version = req.product_name
         
         def fetch_docs() -> List[Dict[str, str]]:
             res_main = collection.query.hybrid(
