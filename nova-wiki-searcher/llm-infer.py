@@ -295,6 +295,7 @@ class RAGReader:
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
         word_count = len(last_user_msg.split())
         
+        promt_start_time = time.perf_counter()
         if len(req.query) <= 1 or word_count > 15: 
             search_query = last_user_msg
         else:
@@ -328,6 +329,9 @@ class RAGReader:
             
             print(f"Original query: {last_user_msg}")
             print(f"Rewritten query: {search_query}")
+
+        promt_end_time = time.perf_counter()
+        print(f"Время выполнения переписывания промта: {promt_end_time - promt_start_time:.6f} секунд")
 
         match req.product_name:
             case "zvirt":
@@ -383,9 +387,12 @@ class RAGReader:
                     })
 
             return raw_objects
-
+        
+        docs_start_time = time.perf_counter()
         raw_docs = await fetch_docs_parallel()
         print(f"Retrieved {len(raw_docs)} documents from Weaviate")
+        docs_end_time = time.perf_counter()
+        print(f"Время выполнения поиска документов: {docs_end_time - docs_start_time:.6f} секунд")
 
         if not raw_docs:
             return OutputAnswer(answer="No relevant docs found")
@@ -405,10 +412,13 @@ class RAGReader:
         )
         
         print("Generating answer")
+        answer_start_time = time.perf_counter()
         final_sampling = SamplingParams(
             temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=800
         )
         final_answer = await self._generate_text(final_prompt, final_sampling)
+        answer_end_time = time.perf_counter()
+        print(f"Время выполнения генерации ответа: {answer_end_time - answer_start_time:.6f} секунд")
         
         return OutputAnswer(answer=final_answer)
 
