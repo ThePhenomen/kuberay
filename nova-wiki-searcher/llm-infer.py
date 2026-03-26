@@ -365,7 +365,9 @@ class RAGReader:
             raw_objects = []
             for res in (res_main, res_knowledgebase, res_solutions):
                 for o in (res.objects):
-                    print(f"{o.properties.get("source")}, {o.metadata.score}")
+                    source = o.properties.get("source")
+                    score = o.metadata.score
+                    print(f"{source}, {score}")
                 for obj in res.objects or []:
                     raw_objects.append({
                         "title": obj.properties.get("title", ""),
