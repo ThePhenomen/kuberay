@@ -228,7 +228,7 @@ class RAGReader:
             model=MODEL_NAME,
             #tensor_parallel_size=1,
             gpu_memory_utilization=0.85,
-            #max_model_len=8192,
+            max_model_len=32768,
             trust_remote_code=True,
             enable_chunked_prefill=True,
             # quantization="fp8",
@@ -334,31 +334,38 @@ class RAGReader:
                 collection = self.nova_collection
                 version = req.product_name
         
-        def fetch_docs() -> List[Dict[str, str]]:
-            res_main = collection.query.hybrid(
-                query=search_query,
-                alpha=0.3,
-                limit=10, 
-                filters=Filter.by_property("version").equal(req.product_version),
-                return_metadata=MetadataQuery(score=True),
-            )
-            res_knowledgebase = self.knowledgebase_collection.query.hybrid(
-                query=search_query,
-                alpha=0.3,
-                limit=5,
-                filters=Filter.by_property("version").equal(version),
-                return_metadata=MetadataQuery(score=True),
-            )
-            res_solutions = self.solutions_collection.query.hybrid(
-                query=search_query,
-                alpha=0.3,
-                limit=5,
-                filters=Filter.by_property("version").equal(version),
-                return_metadata=MetadataQuery(score=True),
+        async def fetch_docs_parallel() -> List[Dict[str, Any]]:
+            res_main, res_knowledgebase, res_solutions = await asyncio.gather(
+                asyncio.to_thread(
+                    collection.query.hybrid,
+                    query=search_query,
+                    alpha=0.3,
+                    limit=10,
+                    filters=Filter.by_property("version").equal(req.product_version),
+                    return_metadata=MetadataQuery(score=True),
+                ),
+                asyncio.to_thread(
+                    self.knowledgebase_collection.query.hybrid,
+                    query=search_query,
+                    alpha=0.3,
+                    limit=5,
+                    filters=Filter.by_property("version").equal(version),
+                    return_metadata=MetadataQuery(score=True),
+                ),
+                asyncio.to_thread(
+                    self.solutions_collection.query.hybrid,
+                    query=search_query,
+                    alpha=0.3,
+                    limit=5,
+                    filters=Filter.by_property("version").equal(version),
+                    return_metadata=MetadataQuery(score=True),
+                ),
             )
 
             raw_objects = []
             for res in (res_main, res_knowledgebase, res_solutions):
+                for o in (res.objects):
+                    print(f"{o.properties.get("source")}, {o.metadata.score}")
                 for obj in res.objects or []:
                     raw_objects.append({
                         "title": obj.properties.get("title", ""),
@@ -369,7 +376,7 @@ class RAGReader:
 
             return raw_objects
 
-        raw_docs = await asyncio.to_thread(fetch_docs)
+        raw_docs = await fetch_docs_parallel()
         print(f"Retrieved {len(raw_docs)} documents from Weaviate")
 
         if not raw_docs:
