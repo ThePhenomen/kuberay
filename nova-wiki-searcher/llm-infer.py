@@ -450,7 +450,7 @@ class RAGReader:
         if not raw_docs:
             return OutputAnswer(answer="No relevant docs found")
             
-        reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=7, alpha=0.6)
+        reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=5, alpha=0.6)
         print("Finished reranking documents")
         
         texts_with_links = []
