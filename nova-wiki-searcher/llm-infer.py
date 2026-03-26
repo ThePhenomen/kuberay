@@ -3,6 +3,7 @@ import uuid
 import asyncio
 from typing import List, Dict, Any
 import math
+import time
 
 import torch
 from fastapi import FastAPI, Request
@@ -62,7 +63,7 @@ Your task is to answer user questions about products, invented in OrionSoft, and
    - If the user asks about product behavior, configuration, installation, troubleshooting, or any other documentation-related topic, and you use the <context> block to answer, then at the end of your answer add a "Sources:" section listing all referenced URLs or document titles.
    - Do NOT add a "Sources:" section for meta-questions, greetings, thanks, chitchat, or questions about where you get your answers from.
 8. ANSWER LENGTH: 
-    - Generate at most 800 words. 
+    - Generate at most 600 words. 
     - If the answer is long, prioritize the most important points and omit minor details. Otherwise, all other tokens will be truncated.
 9. LANGUAGE: Use Russian for conversation. 
 </rules>""",
@@ -146,6 +147,7 @@ class Reranker:
         if not docs:
             return []
             
+        start_time = time.perf_counter()
         print("Init reranking")
         pairs = []
         for doc in docs:
@@ -214,6 +216,9 @@ class Reranker:
             for d in scored_docs[:top_k]
         ])
 
+        end_time = time.perf_counter()
+        print(f"Время выполнения: {end_time - start_time:.6f} секунд")
+
         return scored_docs[:top_k]
 
 @serve.deployment(
@@ -226,12 +231,13 @@ class RAGReader:
         
         engine_args = AsyncEngineArgs(
             model=MODEL_NAME,
-            #tensor_parallel_size=1,
             gpu_memory_utilization=0.85,
             max_model_len=32768,
+            max_num_batched_tokens=8192,
             trust_remote_code=True,
             enable_chunked_prefill=True,
-            # quantization="fp8",
+            quantization="fp8",
+            kv_cache_dtype="fp8",
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -400,7 +406,7 @@ class RAGReader:
         
         print("Generating answer")
         final_sampling = SamplingParams(
-            temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=1200
+            temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=800
         )
         final_answer = await self._generate_text(final_prompt, final_sampling)
         
