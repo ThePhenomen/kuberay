@@ -60,11 +60,11 @@ Your task is to answer user questions about products, invented in OrionSoft, and
    - For these meta/self-configuration questions DO NOT use the context for facts and DO NOT add any "Sources:" section.
 6. IDENTITY: If asked who created you, state you were created by OrionSoft to assist with documentation.
 7. SOURCES FOR DOCUMENTATION ANSWERS:
-   - If the user asks about product behavior, configuration, installation, troubleshooting, or any other documentation-related topic, and you use the <context> block to answer, then at the end of your answer add a "Sources:" section listing all referenced URLs or document titles.
+   - If the user asks about product behavior, configuration, installation, troubleshooting, or any other documentation-related topic, and you use the <context> block to answer, then at the end of your answer add a "Sources:" section listing all referenced URLs or document titles. Do not include the same sources multiple times.
    - Do NOT add a "Sources:" section for meta-questions, greetings, thanks, chitchat, or questions about where you get your answers from.
 8. ANSWER LENGTH: 
-    - Generate at most 600 words. 
-    - If the answer is long, prioritize the most important points and omit minor details. Otherwise, all other tokens will be truncated.
+    - Generate at most 400 words. 
+    - Be short and precise. Prioritize the most important points and omit minor details.
 9. LANGUAGE: Use Russian for conversation. 
 </rules>""",
     },
@@ -137,13 +137,7 @@ class Reranker:
         )
         self.model.eval()
 
-    async def rerank(
-        self,
-        query: str,
-        docs: List[Dict[str, str]],
-        top_k: int = 8,
-        alpha: float = 0.5,
-    ) -> List[Dict[str, str]]:
+    async def rerank(self, query: str, docs: List[Dict[str, str]], top_k: int = 8, alpha: float = 0.5) -> List[Dict[str, str]]:
         if not docs:
             return []
             
@@ -350,7 +344,7 @@ class RAGReader:
                     collection.query.hybrid,
                     query=search_query,
                     alpha=0.3,
-                    limit=10,
+                    limit=15,
                     filters=Filter.by_property("version").equal(req.product_version),
                     return_metadata=MetadataQuery(score=True),
                 ),
@@ -358,7 +352,7 @@ class RAGReader:
                     self.knowledgebase_collection.query.hybrid,
                     query=search_query,
                     alpha=0.3,
-                    limit=5,
+                    limit=7,
                     filters=Filter.by_property("version").equal(version),
                     return_metadata=MetadataQuery(score=True),
                 ),
@@ -366,7 +360,7 @@ class RAGReader:
                     self.solutions_collection.query.hybrid,
                     query=search_query,
                     alpha=0.3,
-                    limit=5,
+                    limit=7,
                     filters=Filter.by_property("version").equal(version),
                     return_metadata=MetadataQuery(score=True),
                 ),
@@ -397,7 +391,7 @@ class RAGReader:
         if not raw_docs:
             return OutputAnswer(answer="No relevant docs found")
             
-        reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=8)
+        reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=5, alpha=0.6)
         print("Finished reranking documents")
         
         texts_with_links = []
@@ -414,7 +408,7 @@ class RAGReader:
         print("Generating answer")
         answer_start_time = time.perf_counter()
         final_sampling = SamplingParams(
-            temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=800
+            temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=600
         )
         final_answer = await self._generate_text(final_prompt, final_sampling)
         answer_end_time = time.perf_counter()
