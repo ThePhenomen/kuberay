@@ -532,12 +532,22 @@ class RAGReader:
                 # ===== 1. Генерация HyDE псевдо-документа =====
         hyde_start_time = time.perf_counter()
         hyde_prompt = (
-            f"<|im_start|>system\nYou are an expert IT assistant. "
-            f"Please write a short hypothetical document or answer snippet that perfectly addresses the user's query. "
-            f"Include relevant technical terms if possible. Answer in Russian, do not write greetings.<|im_end|>\n"
-            f"<|im_start|>user\nQuery: {search_query}<|im_end|>\n<|im_start|>assistant\n"
+            f"<|im_start|>system\n"
+            f"You are an expert IT assistant. "
+            f"Write a single concise technical paragraph that directly answers the user's query. "
+            f"Use only essential information, no introductions, no conclusions, no greetings, "
+            f"no lists, no code blocks, no Markdown formatting. "
+            f"Maximum 80–100 words. Answer in Russian.\n"
+            f"<|im_end|>\n"
+            f"<|im_start|>user\nQuery: {search_query}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
         )
-        hyde_params = SamplingParams(temperature=0.3, max_tokens=250)
+        hyde_params = SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            max_tokens=120
+        )
         hyde_document = await self._generate_text(hyde_prompt, hyde_params)
         hyde_end_time = time.perf_counter()
         print(f"HyDe generated in {hyde_end_time - hyde_start_time:.6f}s")
