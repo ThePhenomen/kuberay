@@ -193,7 +193,8 @@ class Reranker:
         self.model = AutoModelForSequenceClassification.from_pretrained(
             RERANKER_MODEL_ID,
             torch_dtype=torch.float16,
-            device_map="cuda"
+            device_map="cuda",
+            local_files_only=True,
         )
         self.model.eval()
 
