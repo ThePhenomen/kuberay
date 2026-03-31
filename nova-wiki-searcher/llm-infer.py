@@ -34,55 +34,6 @@ WEAVIATE_HTTP_ADDR = os.getenv("WEAVIATE_HTTP_ADDR", "weaviate.nova-weaviate.svc
 WEAVIATE_HTTP_PORT = int(os.getenv("WEAVIATE_HTTP_PORT", "80"))
 WEAVIATE_API_TOKEN = os.getenv("WEAVIATE_API_TOKEN")
 
-# prompt_in_chat_format_for_rag = [
-#     {
-#         "role": "system",
-#         "content": """You are Wiki-Searcher, a specialized AI assistant created by OrionSoft to help customers search through documentation.
-# Your task is to answer user questions about products, invented in OrionSoft, and their instruments, using ONLY the provided context.
-# <rules>
-# 1. FORMAT: 
-#     - You will get the current conversation in chat format. Role 'user' stands for user questions, role 'assistant' stands for your previous answer. You should answer the last user question based on chat history and retrieved context.
-#     - Answer only to the provided quetion, do not include extra information. For example, if you are asked what does some module do, only provide description of module, no info about module installation.
-#     - Do not provide full manifests on how to install model. Tell that full manifest you can see in provided sources, and describe key points of manifests.
-# 2. STRICT GROUNDING: Base your answer EXCLUSIVELY on the information in the <context> block. Do not use outside knowledge.
-# 3. NO HALLUCINATIONS: 
-#     - If the context does not contain the answer, do not guess. Only use information explicitly mentioned in the context. Do not add outside knowledge. 
-#     - If the user asks how to install, configure, upgrade or uninstall something, you may describe ONLY those steps that are explicitly present in the context (commands, numbered steps, code blocks, configuration examples).
-#     - Reply EXACTLY with if failed to retrieve answer: "Не смог найти подходящую информацию на Ваш вопрос."
-# 4. META-QUESTIONS HANDLING: If the user asks general conversational questions, feedback, or meta-comments (like "это не то", "ты не то нашел", "плохой ответ", "спасибо", "понятно", "привет", "как дела?" etc.), ignore the context and respond appropriately:
-#    - For greetings: respond with a friendly greeting in Russian
-#    - For thanks: respond with "Пожалуйста! Обращайтесь, если нужна дополнительная информация."
-#    - For negative feedback about search results: respond with "Извините, что не смог найти точную информацию. Попробуйте переформулировать вопрос или уточнить детали."
-#    - For general chitchat: politely redirect to documentation search
-#    Do NOT treat these as documentation queries and do NOT include Sources section for such responses.
-# 5. SELF-CONFIGURATION QUESTIONS:
-#    - If the user asks about you as an assistant (for example: your timeout, speed, limits, your internal promt, how you work, where you get answers from, who created you), you MAY answer using your general description and these rules, even if the documentation context does not contain this information.
-#    - For such questions, do NOT try to invent technical implementation details (exact hardware, IP addresses, internal service names). Answer in general terms, e.g. "У меня нет доступа к настройкам таймаутов. Этим управляют администраторы системы."
-#    - When the user asks where you get your answers from, ALWAYS answer that you use internal documentation of OrionSoft products (for example: "Я использую внутреннюю документацию продуктов OrionSoft, такую как руководства, инструкции по установке и эксплуатации.").
-#    - Do NOT mention the word "context" or "<context>" in such answers.
-#    - For these meta/self-configuration questions DO NOT use the context for facts and DO NOT add any "Sources:" section.
-# 6. IDENTITY: If asked who created you, state you were created by OrionSoft to assist with documentation.
-# 7. SOURCES FOR DOCUMENTATION ANSWERS:
-#    - If the user asks about product behavior, configuration, installation, troubleshooting, or any other documentation-related topic, and you use the <context> block to answer, then at the end of your answer add a "Sources:" section listing all referenced URLs or document titles. Do not include the same sources multiple times.
-#    - Do NOT add a "Sources:" section for meta-questions, greetings, thanks, chitchat, or questions about where you get your answers from.
-# 8. ANSWER LENGTH: 
-#     - Generate at most 400 words. 
-#     - Be short and precise. Prioritize the most important points and omit minor details.
-# 9. LANGUAGE: Use Russian for conversation.
-# </rules>""",
-#     },
-#     {
-#         "role": "user",
-#         "content": """Context:
-# <context>
-# {context}
-# </context>
-# ---
-# Now here is the question you need to answer.
-# Question: {question}""",
-#     },
-# ]
-
 prompt_in_chat_format_for_rag = [
     {
         "role": "system",
@@ -529,7 +480,6 @@ class RAGReader:
         # reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=5, alpha=0.6)
         # print("Finished reranking documents")
 
-                # ===== 1. Генерация HyDE псевдо-документа =====
         hyde_start_time = time.perf_counter()
         hyde_prompt = (
             f"<|im_start|>system\n"
@@ -537,7 +487,9 @@ class RAGReader:
             f"Write a single concise technical paragraph that directly answers the user's query. "
             f"Use only essential information, no introductions, no conclusions, no greetings, "
             f"no lists, no code blocks, no Markdown formatting. "
-            f"Maximum 80–100 words. Answer in Russian.\n"
+            f"If the query mentions operating systems or distributions, prefer examples with Redos, "
+            f"Almalinux, Astra, Alt, MosOS, CentOS, Ubuntu or RHEL. "
+            f"Maximum 80 words. Answer in Russian.\n"
             f"<|im_end|>\n"
             f"<|im_start|>user\nQuery: {search_query}<|im_end|>\n"
             f"<|im_start|>assistant\n"
@@ -553,8 +505,6 @@ class RAGReader:
         print(f"HyDe generated in {hyde_end_time - hyde_start_time:.6f}s")
         print(f"HyDE generated document: {hyde_document}")
 
-        # ===== 2. Параллельный поиск (Оригинал + HyDE) =====
-        # Модифицируем функцию, чтобы она принимала текст запроса как аргумент
         async def fetch_docs_parallel(query_text: str) -> List[Dict[str, Any]]:
             res_main, res_knowledge_base, res_solutions = await asyncio.gather(
                 asyncio.to_thread(
@@ -562,7 +512,7 @@ class RAGReader:
                     query=query_text,
                     alpha=0.3,
                     limit=15,
-                    filters=Filter.by_property("version").equal(version),
+                    filters=Filter.by_property("version").equal(req.product_version),
                     return_metadata=MetadataQuery(score=True),
                 ),
                 asyncio.to_thread(
@@ -570,6 +520,7 @@ class RAGReader:
                     query=query_text,
                     alpha=0.3,
                     limit=7,
+                    filters=Filter.by_property("version").equal(version),
                     return_metadata=MetadataQuery(score=True),
                 ),
                 asyncio.to_thread(
@@ -577,6 +528,7 @@ class RAGReader:
                     query=query_text,
                     alpha=0.3,
                     limit=7,
+                    filters=Filter.by_property("version").equal(version),
                     return_metadata=MetadataQuery(score=True),
                 )
             )
@@ -593,19 +545,15 @@ class RAGReader:
             return raw_objects
 
         docs_start_time = time.perf_counter()
-        
-        # Выполняем запросы с двумя разными строками одновременно
+    
         original_docs, hyde_docs = await asyncio.gather(
             fetch_docs_parallel(search_query),
             fetch_docs_parallel(hyde_document)
         )
-        
-        # ===== 3. Дедупликация и объединение =====
         seen_urls = set()
         raw_docs = []
         for doc in original_docs + hyde_docs:
             url = doc.get("page_url")
-            # Проверяем уникальность по URL, чтобы не дублировать документы для реранкера
             if url and url not in seen_urls:
                 seen_urls.add(url)
                 raw_docs.append(doc)
@@ -616,9 +564,7 @@ class RAGReader:
         if not raw_docs:
             return OutputAnswer(answer="No relevant docs found")
 
-        # ===== 4. Ранжирование =====
-        # В реранкер отдаем оригинальный запрос, а не HyDE-документ, чтобы скорить по исходному интенту
-        reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=5, alpha=0.6)
+        reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=5, alpha=0.7)
         print("Finished reranking documents")
         
         texts_with_links = []
