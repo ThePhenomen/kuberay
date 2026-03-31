@@ -122,9 +122,11 @@ Rules:
    - short direct answer;
    - 2-6 bullet points if needed;
    - then:
-     Sources:
+     Источники:
      - source 1
      - source 2
+     - ...
+    Provide only sources which were used to generate answer.
 14. Include only the sources you actually used, without duplicates."""
     },
     {
@@ -186,67 +188,59 @@ app = FastAPI()
 )
 class Reranker:
     def __init__(self):
-        print(f"Loading reranker model: {RERANKER_MODEL_ID}")
-        self.tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_ID, trust_remote_code=True)
+        print(f"Loading reranker model {RERANKER_MODEL_ID}")
+        self.tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_ID)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             RERANKER_MODEL_ID,
-            trust_remote_code=True,
             torch_dtype=torch.float16,
-            device_map="cuda",
+            device_map="cuda"
         )
         self.model.eval()
 
     async def rerank(self, query: str, docs: List[Dict[str, str]], top_k: int = 8, alpha: float = 0.5) -> List[Dict[str, str]]:
         if not docs:
             return []
-            
+        
         start_time = time.perf_counter()
         print("Init reranking")
+        
         pairs = []
         for doc in docs:
             title = doc.get("title", "")
             content = doc.get("page_content", "")
-            snippet = f"{title}\n\n{content[:1500]}"
+            snippet = f"{title}\n{content}"[:1500] 
             pairs.append([query, snippet])
 
         device = next(self.model.parameters()).device
-
         print("Start reranking")
         with torch.no_grad():
             inputs = self.tokenizer(
                 pairs,
                 padding=True,
                 truncation=True,
-                max_length=512,
-                return_tensors="pt",
+                max_length=1024,
+                return_tensors="pt"
             ).to(device)
             
-            rerank_scores = (
-                self.model(**inputs, return_dict=True)
-                .logits.view(-1)
-                .float()
-                .tolist()
-            )
-
+            rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
+            
         print(f"Raw rerank scores: {rerank_scores}")
-
+        
         hybrid_scores = [float(doc.get("hybrid_score", 0.0)) for doc in docs]
         eps = 1e-8
 
-        def minmax_norm(values: List[float]) -> List[float]:
-            v_min = min(values)
-            v_max = max(values)
-            if math.isclose(v_min, v_max):
+        def min_max_norm(values: List[float]) -> List[float]:
+            vmin = min(values)
+            vmax = max(values)
+            if math.isclose(vmin, vmax):
                 return [0.5 for _ in values]
-            return [(v - v_min) / (v_max - v_min + eps) for v in values]
+            return [(v - vmin) / (vmax - vmin + eps) for v in values]
 
-        hybrid_norm = minmax_norm(hybrid_scores)
-        rerank_norm = minmax_norm(rerank_scores)
+        hybrid_norm = min_max_norm(hybrid_scores)
+        rerank_norm = min_max_norm(rerank_scores)
 
         scored_docs = []
-        for doc, h_raw, h_n, r_raw, r_n in zip(
-            docs, hybrid_scores, hybrid_norm, rerank_scores, rerank_norm
-        ):
+        for doc, h_raw, h_n, r_raw, r_n in zip(docs, hybrid_scores, hybrid_norm, rerank_scores, rerank_norm):
             combined = alpha * r_n + (1.0 - alpha) * h_n
             doc["hybrid_score_raw"] = h_raw
             doc["rerank_score_raw"] = r_raw
@@ -257,22 +251,103 @@ class Reranker:
 
         scored_docs.sort(key=lambda d: d["combined_score"], reverse=True)
 
-        print("Top docs (combined):", [
-            (
-                d.get("page_url"),
-                d["hybrid_score_raw"],
-                d["rerank_score_raw"],
-                d["hybrid_score_norm"],
-                d["rerank_score_norm"],
-                d["combined_score"],
-            )
-            for d in scored_docs[:top_k]
-        ])
+        print("Top docs combined:")
+        for d in scored_docs[:top_k]:
+            print(f"  {d.get('page_url')}, h={d['hybrid_score_raw']}, r={d['rerank_score_raw']}, hn={d['hybrid_score_norm']}, rn={d['rerank_score_norm']}, combined={d['combined_score']}")
 
         end_time = time.perf_counter()
-        print(f"Время выполнения: {end_time - start_time:.6f} секунд")
-
+        print(f"Reranking done in {end_time - start_time:.6f} s")
         return scored_docs[:top_k]
+
+# class Reranker:
+#     def __init__(self):
+#         print(f"Loading reranker model: {RERANKER_MODEL_ID}")
+#         self.tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_ID, trust_remote_code=True)
+#         self.model = AutoModelForSequenceClassification.from_pretrained(
+#             RERANKER_MODEL_ID,
+#             trust_remote_code=True,
+#             torch_dtype=torch.float16,
+#             device_map="cuda",
+#         )
+#         self.model.eval()
+
+#     async def rerank(self, query: str, docs: List[Dict[str, str]], top_k: int = 8, alpha: float = 0.5) -> List[Dict[str, str]]:
+#         if not docs:
+#             return []
+            
+#         start_time = time.perf_counter()
+#         print("Init reranking")
+#         pairs = []
+#         for doc in docs:
+#             title = doc.get("title", "")
+#             content = doc.get("page_content", "")
+#             snippet = f"{title}\n\n{content[:1500]}"
+#             pairs.append([query, snippet])
+
+#         device = next(self.model.parameters()).device
+
+#         print("Start reranking")
+#         with torch.no_grad():
+#             inputs = self.tokenizer(
+#                 pairs,
+#                 padding=True,
+#                 truncation=True,
+#                 max_length=512,
+#                 return_tensors="pt",
+#             ).to(device)
+            
+#             rerank_scores = (
+#                 self.model(**inputs, return_dict=True)
+#                 .logits.view(-1)
+#                 .float()
+#                 .tolist()
+#             )
+
+#         print(f"Raw rerank scores: {rerank_scores}")
+
+#         hybrid_scores = [float(doc.get("hybrid_score", 0.0)) for doc in docs]
+#         eps = 1e-8
+
+#         def minmax_norm(values: List[float]) -> List[float]:
+#             v_min = min(values)
+#             v_max = max(values)
+#             if math.isclose(v_min, v_max):
+#                 return [0.5 for _ in values]
+#             return [(v - v_min) / (v_max - v_min + eps) for v in values]
+
+#         hybrid_norm = minmax_norm(hybrid_scores)
+#         rerank_norm = minmax_norm(rerank_scores)
+
+#         scored_docs = []
+#         for doc, h_raw, h_n, r_raw, r_n in zip(
+#             docs, hybrid_scores, hybrid_norm, rerank_scores, rerank_norm
+#         ):
+#             combined = alpha * r_n + (1.0 - alpha) * h_n
+#             doc["hybrid_score_raw"] = h_raw
+#             doc["rerank_score_raw"] = r_raw
+#             doc["hybrid_score_norm"] = h_n
+#             doc["rerank_score_norm"] = r_n
+#             doc["combined_score"] = combined
+#             scored_docs.append(doc)
+
+#         scored_docs.sort(key=lambda d: d["combined_score"], reverse=True)
+
+#         print("Top docs (combined):", [
+#             (
+#                 d.get("page_url"),
+#                 d["hybrid_score_raw"],
+#                 d["rerank_score_raw"],
+#                 d["hybrid_score_norm"],
+#                 d["rerank_score_norm"],
+#                 d["combined_score"],
+#             )
+#             for d in scored_docs[:top_k]
+#         ])
+
+#         end_time = time.perf_counter()
+#         print(f"Время выполнения: {end_time - start_time:.6f} секунд")
+
+#         return scored_docs[:top_k]
 
 @serve.deployment(
     num_replicas=1,
@@ -397,40 +472,103 @@ class RAGReader:
                 collection = self.nova_collection
                 version = req.product_name
         
-        async def fetch_docs_parallel() -> List[Dict[str, Any]]:
-            res_main, res_knowledgebase, res_solutions = await asyncio.gather(
+        # async def fetch_docs_parallel() -> List[Dict[str, Any]]:
+        #     res_main, res_knowledgebase, res_solutions = await asyncio.gather(
+        #         asyncio.to_thread(
+        #             collection.query.hybrid,
+        #             query=search_query,
+        #             alpha=0.3,
+        #             limit=15,
+        #             filters=Filter.by_property("version").equal(req.product_version),
+        #             return_metadata=MetadataQuery(score=True),
+        #         ),
+        #         asyncio.to_thread(
+        #             self.knowledgebase_collection.query.hybrid,
+        #             query=search_query,
+        #             alpha=0.3,
+        #             limit=7,
+        #             filters=Filter.by_property("version").equal(version),
+        #             return_metadata=MetadataQuery(score=True),
+        #         ),
+        #         asyncio.to_thread(
+        #             self.solutions_collection.query.hybrid,
+        #             query=search_query,
+        #             alpha=0.3,
+        #             limit=7,
+        #             filters=Filter.by_property("version").equal(version),
+        #             return_metadata=MetadataQuery(score=True),
+        #         ),
+        #     )
+
+        #     raw_objects = []
+        #     for res in (res_main, res_knowledgebase, res_solutions):
+        #         for o in (res.objects):
+        #             source = o.properties.get("source")
+        #             score = o.metadata.score
+        #             print(f"{source}, {score}")
+        #         for obj in res.objects or []:
+        #             raw_objects.append({
+        #                 "title": obj.properties.get("title", ""),
+        #                 "page_content": obj.properties.get("page_content", ""),
+        #                 "page_url": obj.properties.get("page_url", ""),
+        #                 "hybrid_score": obj.metadata.score or 0.0
+        #             })
+
+        #     return raw_objects
+        
+        # docs_start_time = time.perf_counter()
+        # raw_docs = await fetch_docs_parallel()
+        # print(f"Retrieved {len(raw_docs)} documents from Weaviate")
+        # docs_end_time = time.perf_counter()
+        # print(f"Время выполнения поиска документов: {docs_end_time - docs_start_time:.6f} секунд")
+
+        # if not raw_docs:
+        #     return OutputAnswer(answer="No relevant docs found")
+            
+        # reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=5, alpha=0.6)
+        # print("Finished reranking documents")
+
+                # ===== 1. Генерация HyDE псевдо-документа =====
+        hyde_prompt = (
+            f"<|im_start|>system\nYou are an expert IT assistant. "
+            f"Please write a short hypothetical document or answer snippet that perfectly addresses the user's query. "
+            f"Include relevant technical terms if possible. Answer in Russian, do not write greetings.<|im_end|>\n"
+            f"<|im_start|>user\nQuery: {search_query}<|im_end|>\n<|im_start|>assistant\n"
+        )
+        hyde_params = SamplingParams(temperature=0.3, max_tokens=250)
+        hyde_document = await self.generate_text(hyde_prompt, hyde_params)
+        print(f"HyDE generated document: {hyde_document}")
+
+        # ===== 2. Параллельный поиск (Оригинал + HyDE) =====
+        # Модифицируем функцию, чтобы она принимала текст запроса как аргумент
+        async def fetch_docs_parallel(query_text: str) -> List[Dict[str, Any]]:
+            res_main, res_knowledge_base, res_solutions = await asyncio.gather(
                 asyncio.to_thread(
                     collection.query.hybrid,
-                    query=search_query,
+                    query=query_text,
                     alpha=0.3,
                     limit=15,
-                    filters=Filter.by_property("version").equal(req.product_version),
+                    filters=Filter.by_property("version").equal(version),
                     return_metadata=MetadataQuery(score=True),
                 ),
                 asyncio.to_thread(
-                    self.knowledgebase_collection.query.hybrid,
-                    query=search_query,
+                    self.knowledge_base_collection.query.hybrid,
+                    query=query_text,
                     alpha=0.3,
                     limit=7,
-                    filters=Filter.by_property("version").equal(version),
                     return_metadata=MetadataQuery(score=True),
                 ),
                 asyncio.to_thread(
                     self.solutions_collection.query.hybrid,
-                    query=search_query,
+                    query=query_text,
                     alpha=0.3,
                     limit=7,
-                    filters=Filter.by_property("version").equal(version),
                     return_metadata=MetadataQuery(score=True),
-                ),
+                )
             )
 
             raw_objects = []
-            for res in (res_main, res_knowledgebase, res_solutions):
-                for o in (res.objects):
-                    source = o.properties.get("source")
-                    score = o.metadata.score
-                    print(f"{source}, {score}")
+            for res in (res_main, res_knowledge_base, res_solutions):
                 for obj in res.objects or []:
                     raw_objects.append({
                         "title": obj.properties.get("title", ""),
@@ -438,18 +576,34 @@ class RAGReader:
                         "page_url": obj.properties.get("page_url", ""),
                         "hybrid_score": obj.metadata.score or 0.0
                     })
-
             return raw_objects
-        
-        docs_start_time = time.perf_counter()
-        raw_docs = await fetch_docs_parallel()
-        print(f"Retrieved {len(raw_docs)} documents from Weaviate")
-        docs_end_time = time.perf_counter()
-        print(f"Время выполнения поиска документов: {docs_end_time - docs_start_time:.6f} секунд")
 
+        docs_start_time = time.perf_counter()
+        
+        # Выполняем запросы с двумя разными строками одновременно
+        original_docs, hyde_docs = await asyncio.gather(
+            fetch_docs_parallel(search_query),
+            fetch_docs_parallel(hyde_document)
+        )
+        
+        # ===== 3. Дедупликация и объединение =====
+        seen_urls = set()
+        raw_docs = []
+        for doc in original_docs + hyde_docs:
+            url = doc.get("page_url")
+            # Проверяем уникальность по URL, чтобы не дублировать документы для реранкера
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                raw_docs.append(doc)
+                
+        docs_end_time = time.perf_counter()
+        print(f"Retrieved {len(raw_docs)} unique documents (Original + HyDE) in {docs_end_time - docs_start_time:.6f}s")
+        
         if not raw_docs:
             return OutputAnswer(answer="No relevant docs found")
-            
+
+        # ===== 4. Ранжирование =====
+        # В реранкер отдаем оригинальный запрос, а не HyDE-документ, чтобы скорить по исходному интенту
         reranked_docs = await self.reranker.rerank.remote(search_query, raw_docs, top_k=5, alpha=0.6)
         print("Finished reranking documents")
         
