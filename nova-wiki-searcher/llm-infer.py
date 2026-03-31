@@ -544,6 +544,7 @@ class RAGReader:
                         "title": obj.properties.get("title", ""),
                         "page_content": obj.properties.get("page_content", ""),
                         "page_url": obj.properties.get("page_url", ""),
+                        "source": obj.properties.get("source", ""),
                         "hybrid_score": obj.metadata.score or 0.0
                     })
             return raw_objects
@@ -557,7 +558,7 @@ class RAGReader:
         seen_urls = set()
         raw_docs = []
         for doc in original_docs + hyde_docs:
-            url = doc.get("page_url")
+            url = doc.get("source")
             if url and url not in seen_urls:
                 seen_urls.add(url)
                 raw_docs.append(doc)
