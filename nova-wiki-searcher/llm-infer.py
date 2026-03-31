@@ -206,7 +206,7 @@ class Reranker:
 
         print("Top docs combined:")
         for d in scored_docs[:top_k]:
-            print(f"  {d.get('page_url')}, h={d['hybrid_score_raw']}, r={d['rerank_score_raw']}, hn={d['hybrid_score_norm']}, rn={d['rerank_score_norm']}, combined={d['combined_score']}")
+            print(f"  {d.get('page_url')}, {d.get('source')}, h={d['hybrid_score_raw']}, r={d['rerank_score_raw']}, hn={d['hybrid_score_norm']}, rn={d['rerank_score_norm']}, combined={d['combined_score']}")
 
         end_time = time.perf_counter()
         print(f"Reranking done in {end_time - start_time:.6f} s")
