@@ -536,7 +536,7 @@ class RAGReader:
             f"<|im_start|>user\nQuery: {search_query}<|im_end|>\n<|im_start|>assistant\n"
         )
         hyde_params = SamplingParams(temperature=0.3, max_tokens=250)
-        hyde_document = await self.generate_text(hyde_prompt, hyde_params)
+        hyde_document = await self._generate_text(hyde_prompt, hyde_params)
         print(f"HyDE generated document: {hyde_document}")
 
         # ===== 2. Параллельный поиск (Оригинал + HyDE) =====
