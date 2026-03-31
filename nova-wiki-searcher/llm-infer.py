@@ -530,6 +530,7 @@ class RAGReader:
         # print("Finished reranking documents")
 
                 # ===== 1. Генерация HyDE псевдо-документа =====
+        hyde_start_time = time.perf_counter()
         hyde_prompt = (
             f"<|im_start|>system\nYou are an expert IT assistant. "
             f"Please write a short hypothetical document or answer snippet that perfectly addresses the user's query. "
@@ -538,6 +539,8 @@ class RAGReader:
         )
         hyde_params = SamplingParams(temperature=0.3, max_tokens=250)
         hyde_document = await self._generate_text(hyde_prompt, hyde_params)
+        hyde_end_time = time.perf_counter()
+        print(f"Retrieved {len(raw_docs)} unique documents (Original + HyDE) in {hyde_end_time - hyde_start_time:.6f}s")
         print(f"HyDE generated document: {hyde_document}")
 
         # ===== 2. Параллельный поиск (Оригинал + HyDE) =====
@@ -553,7 +556,7 @@ class RAGReader:
                     return_metadata=MetadataQuery(score=True),
                 ),
                 asyncio.to_thread(
-                    self.knowledge_base_collection.query.hybrid,
+                    self.knowledgebase_collection.query.hybrid,
                     query=query_text,
                     alpha=0.3,
                     limit=7,
