@@ -25,7 +25,7 @@ MODEL_NAME = os.getenv(
 )
 RERANKER_MODEL_ID = os.getenv(
     "RERANKER_MODEL_ID", 
-    "Alibaba-NLP/gte-multilingual-reranker-base"
+    "BAAI/bge-reranker-v2-m3"
 )
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "WikiDocs")
 WEAVIATE_GRPC_ADDR = os.getenv("WEAVIATE_GRPC_ADDR", "weaviate-grpc.nova-weaviate.svc")
@@ -78,7 +78,8 @@ Rules:
      - source 2
      - ...
     Provide only sources which were used to generate answer.
-14. Include only the sources you actually used, without duplicates."""
+14. Include only the sources you actually used, without duplicates.
+15. If the query mentions operating systems or distributions, OrionSoft uses: Redos, Almalinux, Astra, Alt, MosOS, CentOS, Ubuntu. Do not use other OS in answers."""
     },
     {
         "role": "user",
@@ -311,11 +312,12 @@ class RAGReader:
         
         engine_args = AsyncEngineArgs(
             model=MODEL_NAME,
-            gpu_memory_utilization=0.85,
+            gpu_memory_utilization=0.90,
             max_model_len=32768,
             max_num_batched_tokens=16384,
             trust_remote_code=True,
             enable_chunked_prefill=True,
+            enable_prefix_caching=True,
             quantization="fp8",
             kv_cache_dtype="fp8",
         )
@@ -484,11 +486,13 @@ class RAGReader:
         hyde_prompt = (
             f"<|im_start|>system\n"
             f"You are an expert IT assistant. "
-            f"Write a single concise technical paragraph that directly answers the user's query. "
+            f"Answer the user's query with one short technical paragraph. "
             f"Use only essential information, no introductions, no conclusions, no greetings, "
             f"no lists, no code blocks, no Markdown formatting. "
-            f"If the query mentions operating systems or distributions, prefer examples with Redos, "
-            f"Almalinux, Astra, Alt, MosOS, CentOS, Ubuntu or RHEL. "
+            f"If the query mentions operating systems or distributions, "
+            f"mention only OS family names without version numbers "
+            f"(for example: Redos, Almalinux, Astra, Alt, MosOS, CentOS, Ubuntu). "
+            f"Never write specific version numbers or minor releases. "
             f"Maximum 80 words. Answer in Russian.\n"
             f"<|im_end|>\n"
             f"<|im_start|>user\nQuery: {search_query}<|im_end|>\n"
