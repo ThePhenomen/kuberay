@@ -312,14 +312,18 @@ class RAGReader:
         
         engine_args = AsyncEngineArgs(
             model=MODEL_NAME,
-            gpu_memory_utilization=0.90,
+            gpu_memory_utilization=0.95,
             max_model_len=32768,
             max_num_batched_tokens=16384,
             trust_remote_code=True,
             enable_chunked_prefill=True,
             enable_prefix_caching=True,
-            quantization="fp8",
             kv_cache_dtype="fp8",
+            # test
+            #quantization="fp8",
+            stream_interval=20,
+            max_num_seqs=16,
+            max_cudagraph_capture_size=8
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
