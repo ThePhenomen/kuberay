@@ -324,7 +324,7 @@ class RAGReader:
             stream_interval=20,
             max_num_seqs=16,
             max_cudagraph_capture_size=8,
-            reasoning_effort=low,
+            reasoning_effort="low",
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
