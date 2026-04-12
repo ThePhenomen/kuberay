@@ -591,7 +591,7 @@ class RAGReader:
         print("Generating answer")
         answer_start_time = time.perf_counter()
         final_sampling = SamplingParams(
-            temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=600
+            temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=1200
         )
         final_answer = await self._generate_text(final_prompt, final_sampling)
         answer_end_time = time.perf_counter()
