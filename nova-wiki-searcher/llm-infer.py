@@ -38,6 +38,7 @@ WEAVIATE_API_TOKEN = os.getenv("WEAVIATE_API_TOKEN")
 RAG_EXTERNAL_LLM_ENDPOINT = os.getenv("RAG_EXTERNAL_LLM_ENDPOINT")
 RAG_EXTERNAL_LLM_API_KEY = os.getenv("RAG_EXTERNAL_LLM_API_KEY", "EMPTY")
 RAG_EXTERNAL_LLM_MODEL = os.getenv("RAG_EXTERNAL_LLM_MODEL")
+RAG_EXTERNAL_LLM_HAS_REASONING = bool(os.getenv("RAG_EXTERNAL_LLM_HAS_REASONING", True))
 RAG_EXTERNAL_LLM_REASONING_EFFORT = os.getenv(
     "RAG_EXTERNAL_LLM_REASONING_EFFORT",
     "low",
@@ -306,11 +307,12 @@ class RAGReader:
 
         print(f"Messages for gpt: {messages}")
         extra_body = {}
-        if RAG_EXTERNAL_LLM_MODEL == "nvidia/gpt-oss-puzzle-88B":
+        if RAG_EXTERNAL_LLM_HAS_REASONING:
             extra_body["reasoning_effort"] = RAG_EXTERNAL_LLM_REASONING_EFFORT
 
         if extra_body:
             request_kwargs["extra_body"] = extra_body
+        print(f"body for gpt: {request_kwargs}")
 
         response = await self.external_llm_client.chat.completions.create(**request_kwargs)
         print("Done!")
