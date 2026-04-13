@@ -313,6 +313,7 @@ class RAGReader:
             request_kwargs["extra_body"] = extra_body
 
         response = await self.external_llm_client.chat.completions.create(**request_kwargs)
+        print("Done!")
         print(f"Generated external answer: {response.choices[0]}")
         content = response.choices[0].message.content
 
