@@ -304,6 +304,7 @@ class RAGReader:
             "max_tokens": max_tokens,
         }
 
+        print(f"Messages for gpt: {messages}")
         extra_body = {}
         if RAG_EXTERNAL_LLM_MODEL == "nvidia/gpt-oss-puzzle-88B":
             extra_body["reasoning_effort"] = RAG_EXTERNAL_LLM_REASONING_EFFORT
@@ -312,7 +313,7 @@ class RAGReader:
             request_kwargs["extra_body"] = extra_body
 
         response = await self.external_llm_client.chat.completions.create(**request_kwargs)
-        print(f"Geretaed external answer: {response.choices[0]}")
+        print(f"Generated external answer: {response.choices[0]}")
         content = response.choices[0].message.content
 
         if isinstance(content, str):
