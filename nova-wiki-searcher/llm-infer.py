@@ -37,8 +37,10 @@ WEAVIATE_API_TOKEN = os.getenv("WEAVIATE_API_TOKEN")
 
 RAG_EXTERNAL_LLM_ENDPOINT = os.getenv("RAG_EXTERNAL_LLM_ENDPOINT")
 RAG_EXTERNAL_LLM_API_KEY = os.getenv("RAG_EXTERNAL_LLM_API_KEY", "EMPTY")
-RAG_EXTERNAL_LLM_MODEL = os.getenv("RAG_EXTERNAL_LLM_MODEL")
-RAG_EXTERNAL_LLM_HAS_REASONING = bool(os.getenv("RAG_EXTERNAL_LLM_HAS_REASONING", True))
+RAG_EXTERNAL_LLM_MODEL = os.getenv(
+    "RAG_EXTERNAL_LLM_MODEL",
+    "nvidia/gpt-oss-puzzle-88B",
+)
 RAG_EXTERNAL_LLM_REASONING_EFFORT = os.getenv(
     "RAG_EXTERNAL_LLM_REASONING_EFFORT",
     "low",
@@ -233,13 +235,14 @@ class RAGReader:
         engine_args = AsyncEngineArgs(
             model=MODEL_NAME,
             gpu_memory_utilization=0.90,
-            max_model_len=32768,
-            max_num_batched_tokens=16384,
+            max_model_len=8192,
+            max_num_batched_tokens=8192,
             trust_remote_code=True,
-            enable_chunked_prefill=True,
+            enable_chunked_prefill=False,
             enable_prefix_caching=True,
             quantization="fp8",
             kv_cache_dtype="fp8",
+            enforce_eager=False,
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -305,18 +308,17 @@ class RAGReader:
             "max_tokens": max_tokens,
         }
 
-        print(f"Messages for gpt: {messages}")
         extra_body = {}
-        if RAG_EXTERNAL_LLM_HAS_REASONING:
+        if RAG_EXTERNAL_LLM_MODEL == "nvidia/gpt-oss-puzzle-88B":
             extra_body["reasoning_effort"] = RAG_EXTERNAL_LLM_REASONING_EFFORT
 
         if extra_body:
             request_kwargs["extra_body"] = extra_body
-        print(f"body for gpt: {request_kwargs}")
+        
+        print(f"Messages for gpt: {messages}")
 
         response = await self.external_llm_client.chat.completions.create(**request_kwargs)
-        print("Done!")
-        print(f"Generated external answer: {response.choices[0]}")
+        print(f"Geretaed external answer: {response.choices[0]}")
         content = response.choices[0].message.content
 
         if isinstance(content, str):
@@ -412,7 +414,7 @@ class RAGReader:
             f"mention only OS family names without version numbers "
             f"(for example: Redos, Almalinux, Astra, Alt, MosOS, CentOS, Ubuntu). "
             f"Never write specific version numbers or minor releases. "
-            f"Maximum 80 words. Answer in Russian.\n"
+            f"Maximum 60 words. Answer in Russian.\n"
             f"<|im_end|>\n"
             f"<|im_start|>user\nQuery: {search_query}<|im_end|>\n"
             f"<|im_start|>assistant\n"
@@ -421,7 +423,7 @@ class RAGReader:
             temperature=0.0,
             top_p=1.0,
             top_k=-1,
-            max_tokens=120,
+            max_tokens=80,
         )
         hyde_document = await self._generate_text(hyde_prompt, hyde_params)
         hyde_end_time = time.perf_counter()
@@ -468,11 +470,19 @@ class RAGReader:
                         }
                     )
             return raw_objects
+        
+        async def generate_hyde_and_fetch():
+            h_start = time.perf_counter()
+            h_doc = await self._generate_text(hyde_prompt, hyde_params)
+            h_end = time.perf_counter()
+            print(f"HyDe generated in {h_end - h_start:.6f}s")
+            print(f"HyDE generated document: {h_doc}")
+            return await fetch_docs_parallel(h_doc)
 
         docs_start_time = time.perf_counter()
         original_docs, hyde_docs = await asyncio.gather(
             fetch_docs_parallel(search_query),
-            fetch_docs_parallel(hyde_document),
+            generate_hyde_and_fetch()
         )
 
         seen_urls = set()
