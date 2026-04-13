@@ -37,6 +37,7 @@ WEAVIATE_API_TOKEN = os.getenv("WEAVIATE_API_TOKEN")
 
 RAG_EXTERNAL_LLM_ENDPOINT = os.getenv("RAG_EXTERNAL_LLM_ENDPOINT")
 RAG_EXTERNAL_LLM_API_KEY = os.getenv("RAG_EXTERNAL_LLM_API_KEY", "EMPTY")
+RAG_EXTERNAL_LLM_HAS_REASONING = bool(os.getenv("RAG_EXTERNAL_LLM_HAS_REASONING", True))
 RAG_EXTERNAL_LLM_MODEL = os.getenv(
     "RAG_EXTERNAL_LLM_MODEL",
     "nvidia/gpt-oss-puzzle-88B",
@@ -298,7 +299,7 @@ class RAGReader:
     async def _generate_answer_external(
         self,
         messages: List[Dict[str, str]],
-        max_tokens: int = 600,
+        max_tokens: int = 4096,
     ) -> str:
         request_kwargs = {
             "model": RAG_EXTERNAL_LLM_MODEL,
@@ -309,15 +310,16 @@ class RAGReader:
         }
 
         extra_body = {}
-        if RAG_EXTERNAL_LLM_MODEL == "nvidia/gpt-oss-puzzle-88B":
+        if RAG_EXTERNAL_LLM_HAS_REASONING:
             extra_body["reasoning_effort"] = RAG_EXTERNAL_LLM_REASONING_EFFORT
 
         if extra_body:
             request_kwargs["extra_body"] = extra_body
         
-        print(f"Messages for gpt: {messages}")
+        print(f"body for gpt: {request_kwargs}")
 
         response = await self.external_llm_client.chat.completions.create(**request_kwargs)
+        print("Done!")
         print(f"Geretaed external answer: {response.choices[0]}")
         content = response.choices[0].message.content
 
@@ -524,7 +526,7 @@ class RAGReader:
         answer_start_time = time.perf_counter()
         final_answer = await self._generate_answer_external(
             rag_messages,
-            max_tokens=600,
+            max_tokens=4096,
         )
         answer_end_time = time.perf_counter()
         print(f"Время выполнения генерации ответа: {answer_end_time - answer_start_time:.6f} секунд")
