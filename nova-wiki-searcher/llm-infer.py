@@ -706,7 +706,15 @@ class OpenAIAdapter:
                     return
 
             # ВАЖНО: Мы ДОЛЖНЫ ВЕРНУТЬ StreamingResponse наружу!
-            return StreamingResponse(sse_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                sse_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # 2. Обычный режим: С await, без .options(stream=True)
