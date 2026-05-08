@@ -666,7 +666,10 @@ class OpenAIAdapter:
                         if await request.is_disconnected():
                             break
 
-                        content = chunk_text if isinstance(chunk_text, str) else str(chunk_text)
+                        content = chunk_text
+                        if isinstance(chunk_text, str):
+                            content = chunk_text
+
                         if not content:
                             continue
 
@@ -678,7 +681,7 @@ class OpenAIAdapter:
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": chunk_text},
+                                    "delta": {"content": content},
                                     "finish_reason": None,
                                 }
                             ],
@@ -721,7 +724,6 @@ class OpenAIAdapter:
                 req = InputQuestion(query=messages, stream=False)
                 resp = await self.rag.make_prediction.remote(req)
 
-            # Обычный JSON ответ
             return ChatCompletionResponse(
                 id=request_id,
                 object="chat.completion",
