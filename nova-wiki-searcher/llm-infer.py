@@ -363,7 +363,7 @@ class RAGReader:
                 return "".join(parts).strip()
             return str(content).strip()
         else:
-            # Стриминговый ответ (асинхронный генератор)
+            print("Entering streaming mode")
             async def chunk_generator():
                 async for chunk in response:
                     # Извлекаем дельту текста из ответа OpenAI
@@ -633,10 +633,10 @@ class OpenAIAdapter:
 
         if user_request:
             req = InputRagQuestion(query=messages, product_name=product_name, product_version=product_version, stream=stream)
-            resp_or_gen = await self.rag.make_context_prediction.remote(req)
+            resp_or_gen = await self.rag.options(stream=stream).make_context_prediction.remote(req)
         else:
             req = InputQuestion(query=messages, stream=stream)
-            resp_or_gen = await self.rag.make_prediction.remote(req)
+            resp_or_gen = await self.rag.options(stream=stream).make_prediction.remote(req)
 
         if not stream:
             # Обычный JSON ответ
