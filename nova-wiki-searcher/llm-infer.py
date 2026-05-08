@@ -643,45 +643,64 @@ class OpenAIAdapter:
             # SSE Стриминг ответ
             async def sse_generator():
                 try:
-                    # Итерация по чанкам, которые сгенерировал _generate_answer_external
+                    # 1. Отправляем ПЕРВЫЙ инициализирующий чанк с role
+                    init_chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": ""},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f" {json.dumps(init_chunk, ensure_ascii=False)}\n\n"
+
+                    # 2. Итерируемся по токенам
                     async for chunk_text in resp_gen:
-                        # Если клиент отвалился
                         if await request.is_disconnected():
-                            print(f"Client disconnected during stream {request_id}")
                             break
-                            
+
+                        # Пропускаем пустые токены, чтобы не спамить
+                        if not chunk_text:
+                            continue
+
                         chunk_data = {
                             "id": request_id,
                             "object": "chat.completion.chunk",
                             "created": created_time,
                             "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": chunk_text},
-                                "finish_reason": None
-                            }]
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": chunk_text},
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
-                        yield f" {json.dumps(chunk_data)}\n\n"
+                        yield f" {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
 
-                    # Финальный чанк
+                    # 3. Финальный чанк обязательно с пустым объектом delta
                     final_chunk = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
                         "created": created_time,
                         "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }]
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
                     }
-                    yield f" {json.dumps(final_chunk)}\n\n"
+                    yield f" {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
                     yield " [DONE]\n\n"
                 except asyncio.CancelledError:
-                    print(f"Stream {request_id} cancelled")
-                    raise
-
-            return StreamingResponse(sse_generator(), media_type="text/event-stream")
+                    return
 
         else:
             # 2. Обычный режим: С await, без .options(stream=True)
