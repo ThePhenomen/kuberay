@@ -4,18 +4,17 @@ import asyncio
 from typing import List, Dict, Any
 import math
 import time
-
 import torch
+import json
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from ray import serve
-
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
 from openai import AsyncOpenAI
-
 import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, MetadataQuery
@@ -25,7 +24,7 @@ MODEL_NAME = os.getenv(
     "Qwen/Qwen2.5-0.5B-Instruct",
 )
 RERANKER_MODEL_ID = os.getenv(
-    "RERANKER_MODEL_ID", 
+    "RERANKER_MODEL_ID",
     "BAAI/bge-reranker-v2-m3"
 )
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "WikiDocs")
@@ -34,7 +33,6 @@ WEAVIATE_GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
 WEAVIATE_HTTP_ADDR = os.getenv("WEAVIATE_HTTP_ADDR", "weaviate.nova-weaviate.svc")
 WEAVIATE_HTTP_PORT = int(os.getenv("WEAVIATE_HTTP_PORT", "80"))
 WEAVIATE_API_TOKEN = os.getenv("WEAVIATE_API_TOKEN")
-
 RAG_EXTERNAL_LLM_ENDPOINT = os.getenv("RAG_EXTERNAL_LLM_ENDPOINT")
 RAG_EXTERNAL_LLM_API_KEY = os.getenv("RAG_EXTERNAL_LLM_API_KEY", "EMPTY")
 RAG_EXTERNAL_LLM_HAS_REASONING = bool(os.getenv("RAG_EXTERNAL_LLM_HAS_REASONING", True))
@@ -51,9 +49,7 @@ prompt_in_chat_format_for_rag = [
     {
         "role": "system",
         "content": """You are Wiki-Searcher, an OrionSoft assistant for searching product documentation.
-
 Answer in Russian.
-
 Rules:
 1. Use only the information from the provided <context>.
 2. Answer the user's question directly and stay focused on it. Include only information that helps answer this question. Do not add unrelated sections or optional installation details unless the user asks for them.
@@ -123,9 +119,21 @@ class InputRagQuestion(BaseModel):
     query: List[Dict[str, Any]]
     product_name: str
     product_version: str
+    stream: bool = False
 
 class InputQuestion(BaseModel):
     query: List[Dict[str, Any]]
+    stream: bool = False
+
+class ModelCard(BaseModel):
+    id: str
+    object: str = "model"
+    created: int
+    owned_by: str = "local-vllm"
+
+class ModelList(BaseModel):
+    object: str = "list"
+    data: List[ModelCard]
 
 class OutputAnswer(BaseModel):
     answer: str
@@ -143,7 +151,6 @@ class ChatCompletionResponse(BaseModel):
     id: str
     object: str
     choices: List[ChatCompletionResponseChoice]
-
 
 app = FastAPI()
 
@@ -166,19 +173,20 @@ class Reranker:
     async def rerank(self, query: str, docs: List[Dict[str, str]], top_k: int = 8, alpha: float = 0.5) -> List[Dict[str, str]]:
         if not docs:
             return []
-        
+
         start_time = time.perf_counter()
         print("Init reranking")
-        
+
         pairs = []
         for doc in docs:
             title = doc.get("title", "")
             content = doc.get("page_content", "")
-            snippet = f"{title}\n{content}"[:1500] 
+            snippet = f"{title}\n{content}"[:1500]
             pairs.append([query, snippet])
 
         device = next(self.model.parameters()).device
         print("Start reranking")
+
         with torch.no_grad():
             inputs = self.tokenizer(
                 pairs,
@@ -187,11 +195,11 @@ class Reranker:
                 max_length=1024,
                 return_tensors="pt"
             ).to(device)
-            
+
             rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
-            
+
         print(f"Raw rerank scores: {rerank_scores}")
-        
+
         hybrid_scores = [float(doc.get("hybrid_score", 0.0)) for doc in docs]
         eps = 1e-8
 
@@ -247,13 +255,11 @@ class RAGReader:
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-
         self.internal_promt_template = self.tokenizer.apply_chat_template(
             prompt_in_chat_format,
             tokenize=False,
             add_generation_prompt=True,
         )
-
         self.rag_answer_messages_template = prompt_in_chat_format_for_rag
 
         if not RAG_EXTERNAL_LLM_ENDPOINT:
@@ -289,24 +295,23 @@ class RAGReader:
     async def _generate_text(self, prompt: str, sampling_params: SamplingParams) -> str:
         request_id = str(uuid.uuid4())
         generator = self.engine.generate(prompt, sampling_params, request_id)
-
         final_output = None
         async for request_output in generator:
             final_output = request_output
-
         return final_output.outputs[0].text
 
-    async def _generate_answer_external(
+    async def _generate_answer_external_stream(
         self,
         messages: List[Dict[str, str]],
         max_tokens: int = 4096,
-    ) -> str:
+    ):
         request_kwargs = {
             "model": RAG_EXTERNAL_LLM_MODEL,
             "messages": messages,
             "temperature": 0.3,
             "top_p": 0.95,
             "max_tokens": max_tokens,
+            "stream": True,
         }
 
         extra_body = {}
@@ -315,38 +320,65 @@ class RAGReader:
 
         if extra_body:
             request_kwargs["extra_body"] = extra_body
-        
-        print(f"body for gpt: {request_kwargs}")
 
         response = await self.external_llm_client.chat.completions.create(**request_kwargs)
-        print("Done!")
-        print(f"Geretaed external answer: {response.choices[0]}")
-        content = response.choices[0].message.content
+        async for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
 
-        if isinstance(content, str):
-            return content.strip()
+    async def _generate_answer_external(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 4096,
+        stream: bool = False,
+    ):
+        request_kwargs = {
+            "model": RAG_EXTERNAL_LLM_MODEL,
+            "messages": messages,
+            "temperature": 0.3,
+            "top_p": 0.95,
+            "max_tokens": max_tokens,
+            "stream": stream, # Включаем стриминг во внешнем API
+        }
 
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict):
-                    parts.append(part.get("text", ""))
-                else:
-                    parts.append(getattr(part, "text", ""))
-            return "".join(parts).strip()
+        extra_body = {}
+        if RAG_EXTERNAL_LLM_HAS_REASONING:
+            extra_body["reasoning_effort"] = RAG_EXTERNAL_LLM_REASONING_EFFORT
 
-        return str(content).strip()
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        print(f"body for external gpt (stream={stream}): {request_kwargs}")
+
+        response = await self.external_llm_client.chat.completions.create(**request_kwargs)
+
+        if not stream:
+            # Обычный ответ
+            print("Done generating external answer (non-stream)!")
+            content = response.choices[0].message.content
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                parts = [part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "") for part in content]
+                return "".join(parts).strip()
+            return str(content).strip()
+        else:
+            # Стриминговый ответ (асинхронный генератор)
+            async def chunk_generator():
+                async for chunk in response:
+                    # Извлекаем дельту текста из ответа OpenAI
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            return chunk_generator()
 
     async def make_prediction(self, req: InputQuestion) -> OutputAnswer:
         final_prompt = self.internal_promt_template.format(question=req.query)
-
         sampling_params = SamplingParams(
             temperature=0.3,
             top_p=0.95,
             repetition_penalty=1.1,
             max_tokens=200,
         )
-
         answer_text = await self._generate_text(final_prompt, sampling_params)
         return OutputAnswer(answer=answer_text)
 
@@ -354,14 +386,13 @@ class RAGReader:
         print("Got wiki query:", req.query)
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
         word_count = len(last_user_msg.split())
-
         promt_start_time = time.perf_counter()
+
         if len(req.query) <= 1 or word_count > 15:
             search_query = last_user_msg
         else:
             history_msgs = req.query[-4:-1]
             history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_msgs])
-
             rewrite_prompt_messages = [
                 {
                     "role": "system",
@@ -380,13 +411,11 @@ class RAGReader:
                     "content": f"Conversation history:\n{history_text}\n\nLatest question: {last_user_msg}\n\nFinal search query:",
                 },
             ]
-
             rewrite_prompt = self.tokenizer.apply_chat_template(
                 rewrite_prompt_messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
-
             rewrite_sampling = SamplingParams(temperature=0.0, max_tokens=50)
             rewritten_result = await self._generate_text(rewrite_prompt, rewrite_sampling)
             search_query = rewritten_result.strip()
@@ -458,7 +487,6 @@ class RAGReader:
                     return_metadata=MetadataQuery(score=True),
                 ),
             )
-
             raw_objects = []
             for res in (res_main, res_knowledge_base, res_solutions):
                 for obj in res.objects or []:
@@ -472,7 +500,7 @@ class RAGReader:
                         }
                     )
             return raw_objects
-        
+
         async def generate_hyde_and_fetch():
             h_start = time.perf_counter()
             h_doc = await self._generate_text(hyde_prompt, hyde_params)
@@ -509,6 +537,7 @@ class RAGReader:
             text = doc["page_content"]
             link = doc["page_url"]
             texts_with_links.append(f"{text}\n\nИсточник: {link}")
+
         context = "\n\n---\n\n".join(texts_with_links)
 
         rag_messages = [
@@ -523,15 +552,23 @@ class RAGReader:
         ]
 
         print("Generating answer via external endpoint")
-        answer_start_time = time.perf_counter()
-        final_answer = await self._generate_answer_external(
-            rag_messages,
-            max_tokens=4096,
-        )
-        answer_end_time = time.perf_counter()
-        print(f"Время выполнения генерации ответа: {answer_end_time - answer_start_time:.6f} секунд")
-
-        return OutputAnswer(answer=final_answer)
+        if not req.stream:
+            answer_start_time = time.perf_counter()
+            final_answer = await self._generate_answer_external(
+                rag_messages,
+                max_tokens=4096,
+                stream=False
+            )
+            answer_end_time = time.perf_counter()
+            print(f"Answer generated in {answer_end_time - answer_start_time:.6f}s")
+            return OutputAnswer(answer=final_answer)
+        else:
+            answer_generator = await self._generate_answer_external(
+                rag_messages,
+                max_tokens=4096,
+                stream=True
+            )
+            return answer_generator
 
     def close(self):
         if hasattr(self, "weaviate_connection") and self.weaviate_connection is not None:
@@ -543,7 +580,6 @@ class RAGReader:
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
-
 
 reranker_app = Reranker.bind()
 rag_reader_app = RAGReader.bind(reranker_app)
@@ -573,37 +609,110 @@ class OpenAIAdapter:
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(self, request: Request):
         body: Dict[str, Any] = await request.json()
-        
+
         model = body.get("model", "wiki-searcher")
         messages = body.get("messages", [])
+        stream = body.get("stream", True)
         product_name = str(body.get("product_name", "nova"))
         product_version = str(body.get("product_version", "latest"))
         user_request = body.get("user_request", False)
 
         print(f"[OpenAIAdapter] model={model}, product_name={product_name}, product_version={product_version}")
 
+        # if user_request:
+        #     resp: OutputAnswer = await self.rag.make_context_prediction.remote(
+        #         InputRagQuestion(query=messages, product_name=product_name, product_version=product_version)
+        #     )
+        # else:
+        #     resp: OutputAnswer = await self.rag.make_prediction.remote(
+        #         InputQuestion(query=messages)
+        #     )
+
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created_time = int(time.time())
+
         if user_request:
-            resp: OutputAnswer = await self.rag.make_context_prediction.remote(
-                InputRagQuestion(query=messages, product_name=product_name, product_version=product_version)
+            req = InputRagQuestion(query=messages, product_name=product_name, product_version=product_version, stream=stream)
+            resp_or_gen = await self.rag.make_context_prediction.remote(req)
+        else:
+            req = InputQuestion(query=messages, stream=stream)
+            resp_or_gen = await self.rag.make_prediction.remote(req)
+
+        if not stream:
+            # Обычный JSON ответ
+            return ChatCompletionResponse(
+                id=request_id,
+                object="chat.completion",
+                created=created_time,
+                model=model,
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatCompletionResponseChoiceMessage(
+                            role="assistant",
+                            content=resp_or_gen.answer
+                        ),
+                        finish_reason="stop"
+                    )
+                ]
             )
         else:
-            resp: OutputAnswer = await self.rag.make_prediction.remote(
-                InputQuestion(query=messages)
-            )
+            # SSE Стриминг ответ
+            async def sse_generator():
+                try:
+                    # Итерация по чанкам, которые сгенерировал _generate_answer_external
+                    async for chunk_text in resp_or_gen:
+                        # Если клиент отвалился
+                        if await request.is_disconnected():
+                            print(f"Client disconnected during stream {request_id}")
+                            break
+                            
+                        chunk_data = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": chunk_text},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f" {json.dumps(chunk_data)}\n\n"
 
-        return ChatCompletionResponse(
-            id="chatcmpl-custom-1",
-            object="chat.completion",
-            choices=[
-                ChatCompletionResponseChoice(
-                    index=0,
-                    message=ChatCompletionResponseChoiceMessage(
-                        role="assistant",
-                        content=resp.answer,
-                    ),
-                    finish_reason="stop",
-                )
-            ],
-        )
-    
+                    # Финальный чанк
+                    final_chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    yield f" {json.dumps(final_chunk)}\n\n"
+                    yield " [DONE]\n\n"
+                except asyncio.CancelledError:
+                    print(f"Stream {request_id} cancelled")
+                    raise
+
+            return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+        # return ChatCompletionResponse(
+        #     id="chatcmpl-custom-1",
+        #     object="chat.completion",
+        #     choices=[
+        #         ChatCompletionResponseChoice(
+        #             index=0,
+        #             message=ChatCompletionResponseChoiceMessage(
+        #                 role="assistant",
+        #                 content=resp.answer,
+        #             ),
+        #             finish_reason="stop",
+        #         )
+        #     ],
+        # )
+
 openai_app = OpenAIAdapter.bind(rag_reader_app)
