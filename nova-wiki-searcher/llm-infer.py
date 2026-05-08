@@ -658,7 +658,7 @@ class OpenAIAdapter:
                         ],
                     }
                     # ВАЖНО: Обязательно префикс ' '
-                    yield f" {json.dumps(init_chunk, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps(init_chunk, ensure_ascii=False)}\n\n"
 
                     # 2. Итерируемся по токенам
                     async for chunk_text in resp_gen:
@@ -683,7 +683,7 @@ class OpenAIAdapter:
                             ],
                         }
                         # ВАЖНО: Обязательно префикс ' '
-                        yield f" {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
 
                     # 3. Финальный чанк обязательно с пустым объектом delta
                     final_chunk = {
@@ -700,8 +700,8 @@ class OpenAIAdapter:
                         ],
                     }
                     # ВАЖНО: Обязательно префикс ' '
-                    yield f" {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
-                    yield " [DONE]\n\n"
+                    yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
                 except asyncio.CancelledError:
                     return
 
