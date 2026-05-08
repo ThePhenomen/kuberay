@@ -631,37 +631,20 @@ class OpenAIAdapter:
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created_time = int(time.time())
 
-        if user_request:
-            req = InputRagQuestion(query=messages, product_name=product_name, product_version=product_version, stream=stream)
-            resp_or_gen = await self.rag.options(stream=stream).make_context_prediction.remote(req)
-        else:
-            req = InputQuestion(query=messages, stream=stream)
-            resp_or_gen = await self.rag.options(stream=stream).make_prediction.remote(req)
+        if stream:
+            # 1. Режим стриминга: БЕЗ await, с .options(stream=True)
+            if user_request:
+                req = InputRagQuestion(query=messages, product_name=product_name, product_version=product_version, stream=True)
+                resp_gen = self.rag.options(stream=True).make_context_prediction.remote(req)
+            else:
+                req = InputQuestion(query=messages, stream=True)
+                resp_gen = self.rag.options(stream=True).make_prediction.remote(req)
 
-        if not stream:
-            # Обычный JSON ответ
-            return ChatCompletionResponse(
-                id=request_id,
-                object="chat.completion",
-                created=created_time,
-                model=model,
-                choices=[
-                    ChatCompletionResponseChoice(
-                        index=0,
-                        message=ChatCompletionResponseChoiceMessage(
-                            role="assistant",
-                            content=resp_or_gen.answer
-                        ),
-                        finish_reason="stop"
-                    )
-                ]
-            )
-        else:
             # SSE Стриминг ответ
             async def sse_generator():
                 try:
                     # Итерация по чанкам, которые сгенерировал _generate_answer_external
-                    async for chunk_text in resp_or_gen:
+                    async for chunk_text in resp_gen:
                         # Если клиент отвалился
                         if await request.is_disconnected():
                             print(f"Client disconnected during stream {request_id}")
@@ -699,6 +682,33 @@ class OpenAIAdapter:
                     raise
 
             return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+        else:
+            # 2. Обычный режим: С await, без .options(stream=True)
+            if user_request:
+                req = InputRagQuestion(query=messages, product_name=product_name, product_version=product_version, stream=False)
+                resp = await self.rag.make_context_prediction.remote(req)
+            else:
+                req = InputQuestion(query=messages, stream=False)
+                resp = await self.rag.make_prediction.remote(req)
+
+            # Обычный JSON ответ
+            return ChatCompletionResponse(
+                id=request_id,
+                object="chat.completion",
+                created=created_time,
+                model=model,
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatCompletionResponseChoiceMessage(
+                            role="assistant",
+                            content=resp.answer
+                        ),
+                        finish_reason="stop"
+                    )
+                ]
+            )
 
         # return ChatCompletionResponse(
         #     id="chatcmpl-custom-1",
