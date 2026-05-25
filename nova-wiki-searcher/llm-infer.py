@@ -419,7 +419,7 @@ class Searcher:
 class RAGSystem:
     def __init__(self, searcher_handle):
         self.searcher = searcher_handle
-        self.logger = init_logger
+        self.logger = init_logger()
         self.logger.info("Initializing RAGSystem")
         
         engine_args = AsyncEngineArgs(
