@@ -5,14 +5,12 @@ from typing import List, Dict, Any, AsyncGenerator, Optional
 import math
 import time
 import torch
-import json
 import httpx
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from ray import serve
-import ray
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -198,12 +196,14 @@ class Reranker:
     async def rerank(
         self,
         query: str,
+        request_id: str,
         docs: List[Dict[str, str]],
         top_k: int = 8,
         alpha: float = 0.5,
+
     ) -> List[Dict[str, str]]:
         if not docs:
-            self.logger.info("Rerank skipped: no documents")
+            self.logger.info("Rerank skipped: no documents", extra={"request_id": request_id})
             return []
 
         start_time = time.perf_counter()
@@ -213,6 +213,7 @@ class Reranker:
                 "docs_count": len(docs),
                 "top_k": top_k,
                 "alpha": alpha,
+                "request_id": request_id,
             },
         )
 
@@ -235,7 +236,7 @@ class Reranker:
 
             rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
 
-        self.logger.debug("Raw rerank scores computed", extra={"scores": rerank_scores})
+        self.logger.debug("Raw rerank scores computed", extra={"scores": rerank_scores, "request_id": request_id})
 
         hybrid_scores = [float(doc.get("hybrid_score", 0.0)) for doc in docs]
         eps = 1e-8
@@ -273,7 +274,8 @@ class Reranker:
                         "combined_score": d.get("combined_score"),
                     }
                     for d in scored_docs[:top_k]
-                ]
+                ],
+                "request_id": request_id,
             },
         )
 
@@ -284,6 +286,7 @@ class Reranker:
                 "docs_count": len(docs),
                 "returned_docs": min(len(scored_docs), top_k),
                 "elapsed_sec": round(elapsed, 6),
+                "request_id": request_id,
             },
         )
 
@@ -320,7 +323,7 @@ class Searcher:
         self.knowledgebase_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Knowledgebase")
         self.solutions_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Solutions")
 
-    async def _fetch_docs_parallel(self, query_text: str, product_name: str, product_version: str) -> List[Dict[str, Any]]:
+    async def _fetch_docs_parallel(self, query_text: str, product_name: str, product_version: str, request_id: str) -> List[Dict[str, Any]]:
         match product_name:
             case "zvirt":
                 collection = self.zvirt_collection
@@ -332,7 +335,7 @@ class Searcher:
                 collection = self.nova_collection
                 version = product_name
 
-        self.logger.debug("Execute remote document search")
+        self.logger.debug("Execute remote document search", extra={"request_id": request_id})
         res_main, res_knowledge_base, res_solutions = await asyncio.gather(
             asyncio.to_thread(
                 collection.query.hybrid,
@@ -377,12 +380,13 @@ class Searcher:
         queries: List[str], 
         product_name: str, 
         product_version: str, 
+        request_id: str,
         top_k: int = 5,
         alpha: float = 0.7
     ) -> List[Dict[str, Any]]:
         docs_start_time = time.perf_counter()
         
-        tasks = [self._fetch_docs_parallel(q, product_name, product_version) for q in queries]
+        tasks = [self._fetch_docs_parallel(q, product_name, product_version, request_id) for q in queries]
         all_docs_lists = await asyncio.gather(*tasks)
 
         seen_urls = set()
@@ -395,7 +399,7 @@ class Searcher:
                     raw_docs.append(doc)
 
         docs_end_time = time.perf_counter()
-        self.logger.info(f"Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s")
+        self.logger.info(f"Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s", extra={"request_id": request_id})
 
         if not raw_docs:
             return []
@@ -513,13 +517,14 @@ class RAGSystem:
             return "".join([p.get("text", "") if isinstance(p, dict) else getattr(p, "text", "") for p in content]).strip()
         return str(content).strip()
 
-    async def make_prediction(self, req: InputQuestion) -> OutputAnswer:
+    async def make_prediction(self, req: InputQuestion, request_id: str) -> OutputAnswer:
         final_prompt = self.internal_promt_template.format(question=req.query)
         sampling_params = SamplingParams(temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=200)
         answer_text = await self._generate_text(final_prompt, sampling_params)
+        self.logger.info(f"Generating remote answer...", extra={"request_id": request_id})
         return OutputAnswer(answer=answer_text)
 
-    async def make_context_prediction(self, req: InputRagQuestion):
+    async def make_context_prediction(self, req: InputRagQuestion, request_id: str):
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
         
         start_time = time.perf_counter()
@@ -574,7 +579,8 @@ class RAGSystem:
             queries=queries_to_search,
             product_name=req.product_name,
             product_version=req.product_version,
-            top_k=5
+            top_k=5,
+            request_id=request_id,
         )
 
         if not reranked_docs:
@@ -594,9 +600,9 @@ class RAGSystem:
         ]
 
         end_time = time.perf_counter()
-        self.logger.info(f"Init actions done in {end_time - start_time:.6f}s")
+        self.logger.info(f"Init actions for request {request_id} done in {end_time - start_time:.6f}s", extra={"request_id": request_id})
 
-        self.logger.info("Generating remote answer...")
+        self.logger.info(f"Generating remote answer...", extra={"request_id": request_id})
         if not req.stream:
             final_answer = await self._generate_answer_external(rag_messages, max_tokens=4096, stream=False)
             return OutputAnswer(answer=final_answer)
@@ -638,7 +644,7 @@ class SmartRouter:
                 req = InputRagQuestion(
                     query=messages, product_name=product_name, product_version=product_version, stream=True,
                 )
-                resp_gen = self.rag.options(stream=True).make_context_prediction.remote(req)
+                resp_gen = self.rag.options(stream=True).make_context_prediction.remote(req, request_id)
 
                 async def passthrough_sse():
                     try:
@@ -654,10 +660,10 @@ class SmartRouter:
             
         if user_request:
             req = InputRagQuestion(query=messages, product_name=product_name, product_version=product_version, stream=False)
-            resp = await self.rag.make_context_prediction.remote(req)
+            resp = await self.rag.make_context_prediction.remote(req, request_id)
         else:
             req = InputQuestion(query=messages, stream=False)
-            resp = await self.rag.make_prediction.remote(req)
+            resp = await self.rag.make_prediction.remote(req, request_id)
 
         return ChatCompletionResponse(
             id=request_id, object="chat.completion", created=created_time, model=model,
@@ -672,11 +678,13 @@ class SmartRouter:
     
     @app.post("/search", response_model=SearchResponse)
     async def search_endpoint(self, req: SearchRequest):
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
         docs = await self.searcher.search.remote(
             queries=[req.query],
             product_name=req.product_name,
             product_version=req.product_version,
-            top_k=req.top_k
+            top_k=req.top_k,
+            request_id=request_id,
         )
         
         results = []
