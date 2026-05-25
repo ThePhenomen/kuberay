@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from ray import serve
+import ray
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -22,15 +23,18 @@ from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, MetadataQuery
 
 import logging
-
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+ray.init(
+    logging_config=ray.LoggingConfig(encoding="JSON", log_level=LOG_LEVEL)
 )
 
-logger = logging.getLogger("rag_service")
+def init_logger():
+    """Get the root logger"""
+    return logging.getLogger()
+
+logger = logging.getLogger()
+logger.info("Driver process")
 
 MODEL_NAME = os.getenv("READER_MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
 RERANKER_MODEL_ID = os.getenv("RERANKER_MODEL_ID", "BAAI/bge-reranker-v2-m3")
@@ -180,7 +184,8 @@ app = FastAPI()
 )
 class Reranker:
     def __init__(self):
-        logger.info("Loading reranker model", extra={"model_id": RERANKER_MODEL_ID})
+        self.logger = init_logger()
+        self.logger.info("Loading reranker model", extra={"model_id": RERANKER_MODEL_ID})
         self.tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_ID)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             RERANKER_MODEL_ID,
@@ -198,11 +203,11 @@ class Reranker:
         alpha: float = 0.5,
     ) -> List[Dict[str, str]]:
         if not docs:
-            logger.info("Rerank skipped: no documents")
+            self.logger.info("Rerank skipped: no documents")
             return []
 
         start_time = time.perf_counter()
-        logger.info(
+        self.logger.info(
             "Rerank started",
             extra={
                 "docs_count": len(docs),
@@ -230,7 +235,7 @@ class Reranker:
 
             rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
 
-        logger.debug("Raw rerank scores computed", extra={"scores": rerank_scores})
+        self.logger.debug("Raw rerank scores computed", extra={"scores": rerank_scores})
 
         hybrid_scores = [float(doc.get("hybrid_score", 0.0)) for doc in docs]
         eps = 1e-8
@@ -256,7 +261,7 @@ class Reranker:
             scored_docs.append(doc)
         scored_docs.sort(key=lambda d: d["combined_score"], reverse=True)
 
-        logger.debug(
+        self.logger.debug(
             "Top reranked docs",
             extra={
                 "top_docs": [
@@ -273,7 +278,7 @@ class Reranker:
         )
 
         elapsed = time.perf_counter() - start_time
-        logger.info(
+        self.logger.info(
             "Rerank finished",
             extra={
                 "docs_count": len(docs),
@@ -291,7 +296,8 @@ class Reranker:
 class Searcher:
     def __init__(self, reranker_handle):
         self.reranker = reranker_handle
-        logger.info("Initializing Searcher & Weaviate connection")
+        self.logger = init_logger()
+        self.logger.info("Initializing Searcher & Weaviate connection")
         try:
             self.weaviate_connection = weaviate.connect_to_custom(
                 http_host=WEAVIATE_HTTP_ADDR,
@@ -326,6 +332,7 @@ class Searcher:
                 collection = self.nova_collection
                 version = product_name
 
+        self.logger.debug("Execute remote document search")
         res_main, res_knowledge_base, res_solutions = await asyncio.gather(
             asyncio.to_thread(
                 collection.query.hybrid,
@@ -388,7 +395,7 @@ class Searcher:
                     raw_docs.append(doc)
 
         docs_end_time = time.perf_counter()
-        logger.info(f"Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s")
+        self.logger.info(f"Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s")
 
         if not raw_docs:
             return []
@@ -412,7 +419,8 @@ class Searcher:
 class RAGSystem:
     def __init__(self, searcher_handle):
         self.searcher = searcher_handle
-        logger.info("Initializing RAGSystem")
+        self.logger = init_logger
+        self.logger.info("Initializing RAGSystem")
         
         engine_args = AsyncEngineArgs(
             model=MODEL_NAME,
@@ -514,6 +522,7 @@ class RAGSystem:
     async def make_context_prediction(self, req: InputRagQuestion):
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
         
+        start_time = time.perf_counter()
         if len(req.query) <= 1 or len(last_user_msg.split()) > 15:
             search_query = last_user_msg
         else:
@@ -560,7 +569,6 @@ class RAGSystem:
         )
         h_doc = await self._generate_text(hyde_prompt, SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=80))
 
-        # Вызываем новый Searcher через Ray
         queries_to_search = [search_query, h_doc]
         reranked_docs = await self.searcher.search.remote(
             queries=queries_to_search,
@@ -585,6 +593,10 @@ class RAGSystem:
             for item in self.rag_answer_messages_template
         ]
 
+        end_time = time.perf_counter()
+        self.logger.info(f"Init actions done in {end_time - start_time:.6f}s")
+
+        self.logger.info("Generating remote answer...")
         if not req.stream:
             final_answer = await self._generate_answer_external(rag_messages, max_tokens=4096, stream=False)
             return OutputAnswer(answer=final_answer)
