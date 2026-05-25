@@ -25,7 +25,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s %(request_id)s %(message)s",
 )
 
 def init_logger():
@@ -183,7 +183,7 @@ app = FastAPI()
 class Reranker:
     def __init__(self):
         self.logger = init_logger()
-        self.logger.info("Loading reranker model", extra={"model_id": RERANKER_MODEL_ID})
+        self.logger.info(f"Loading reranker model {RERANKER_MODEL_ID}")
         self.tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_ID)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             RERANKER_MODEL_ID,
@@ -208,13 +208,11 @@ class Reranker:
 
         start_time = time.perf_counter()
         self.logger.info(
-            "Rerank started",
-            extra={
-                "docs_count": len(docs),
-                "top_k": top_k,
-                "alpha": alpha,
-                "request_id": request_id,
-            },
+            "Rerank started, docs_count=%d, top_k=%d, alpha=%.2f",
+            len(docs),
+            top_k,
+            alpha,
+            extra={"request_id": request_id},
         )
 
         pairs = []
@@ -236,7 +234,7 @@ class Reranker:
 
             rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
 
-        self.logger.debug("Raw rerank scores computed", extra={"scores": rerank_scores, "request_id": request_id})
+        self.logger.debug(f"Raw rerank scores computed, calucalted scores: {rerank_scores}", extra={"request_id": request_id})
 
         hybrid_scores = [float(doc.get("hybrid_score", 0.0)) for doc in docs]
         eps = 1e-8
@@ -263,31 +261,19 @@ class Reranker:
         scored_docs.sort(key=lambda d: d["combined_score"], reverse=True)
 
         self.logger.debug(
-            "Top reranked docs",
-            extra={
-                "top_docs": [
-                    {
-                        "page_url": d.get("page_url"),
-                        "source": d.get("source"),
-                        "hybrid_score_raw": d.get("hybrid_score_raw"),
-                        "rerank_score_raw": d.get("rerank_score_raw"),
-                        "combined_score": d.get("combined_score"),
-                    }
-                    for d in scored_docs[:top_k]
-                ],
-                "request_id": request_id,
-            },
+            "Top reranked docs (count=%d, top_k=%d)",
+            len(scored_docs),
+            top_k,
+            extra={"request_id": request_id},
         )
 
         elapsed = time.perf_counter() - start_time
         self.logger.info(
-            "Rerank finished",
-            extra={
-                "docs_count": len(docs),
-                "returned_docs": min(len(scored_docs), top_k),
-                "elapsed_sec": round(elapsed, 6),
-                "request_id": request_id,
-            },
+            "Rerank finished (docs=%d, returned=%d, elapsed=%.6f sec)",
+            len(docs),
+            min(len(scored_docs), top_k),
+            round(elapsed, 6),
+            extra={"request_id": request_id},
         )
 
         return scored_docs[:top_k]
