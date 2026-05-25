@@ -25,16 +25,16 @@ from weaviate.classes.query import Filter, MetadataQuery
 import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-ray.init(
-    logging_config=ray.LoggingConfig(encoding="JSON", log_level=LOG_LEVEL)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
 def init_logger():
     """Get the root logger"""
-    return logging.getLogger()
+    return logging.getLogger("rag_service")
 
-logger = logging.getLogger()
-logger.info("Driver process")
+logger = init_logger()
 
 MODEL_NAME = os.getenv("READER_MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
 RERANKER_MODEL_ID = os.getenv("RERANKER_MODEL_ID", "BAAI/bge-reranker-v2-m3")
