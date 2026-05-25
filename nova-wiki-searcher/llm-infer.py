@@ -405,7 +405,7 @@ class Searcher:
             return []
 
         main_query = queries[0]
-        reranked_docs = await self.reranker.rerank.remote(main_query, raw_docs, top_k=top_k, alpha=alpha)
+        reranked_docs = await self.reranker.rerank.remote(main_query, request_id, raw_docs, top_k=top_k, alpha=alpha)
         return reranked_docs
 
     def close(self):
