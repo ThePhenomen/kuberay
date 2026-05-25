@@ -25,7 +25,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s %(request_id)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
 def init_logger():
@@ -203,16 +203,15 @@ class Reranker:
 
     ) -> List[Dict[str, str]]:
         if not docs:
-            self.logger.info("Rerank skipped: no documents", extra={"request_id": request_id})
+            self.logger.info(f"[req: {request_id}] Rerank skipped: no documents")
             return []
 
         start_time = time.perf_counter()
         self.logger.info(
-            "Rerank started, docs_count=%d, top_k=%d, alpha=%.2f",
+            f"[req: {request_id}] Rerank started, docs_count=%d, top_k=%d, alpha=%.2f",
             len(docs),
             top_k,
             alpha,
-            extra={"request_id": request_id},
         )
 
         pairs = []
@@ -234,7 +233,7 @@ class Reranker:
 
             rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
 
-        self.logger.debug(f"Raw rerank scores computed, calucalted scores: {rerank_scores}", extra={"request_id": request_id})
+        self.logger.debug(f"[req: {request_id}] Raw rerank scores computed, calucalted scores: {rerank_scores}")
 
         hybrid_scores = [float(doc.get("hybrid_score", 0.0)) for doc in docs]
         eps = 1e-8
@@ -261,19 +260,17 @@ class Reranker:
         scored_docs.sort(key=lambda d: d["combined_score"], reverse=True)
 
         self.logger.debug(
-            "Top reranked docs (count=%d, top_k=%d)",
+            f"[req: {request_id}] Top reranked docs (count=%d, top_k=%d)",
             len(scored_docs),
             top_k,
-            extra={"request_id": request_id},
         )
 
         elapsed = time.perf_counter() - start_time
         self.logger.info(
-            "Rerank finished (docs=%d, returned=%d, elapsed=%.6f sec)",
+            f"[req: {request_id}] Rerank finished (docs=%d, returned=%d, elapsed=%.6f sec)",
             len(docs),
             min(len(scored_docs), top_k),
             round(elapsed, 6),
-            extra={"request_id": request_id},
         )
 
         return scored_docs[:top_k]
@@ -321,7 +318,7 @@ class Searcher:
                 collection = self.nova_collection
                 version = product_name
 
-        self.logger.debug("Execute remote document search", extra={"request_id": request_id})
+        self.logger.debug(f"[req: {request_id}] Execute remote document search")
         res_main, res_knowledge_base, res_solutions = await asyncio.gather(
             asyncio.to_thread(
                 collection.query.hybrid,
@@ -385,7 +382,7 @@ class Searcher:
                     raw_docs.append(doc)
 
         docs_end_time = time.perf_counter()
-        self.logger.info(f"Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s", extra={"request_id": request_id})
+        self.logger.info(f"[req: {request_id}] Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s")
 
         if not raw_docs:
             return []
@@ -507,7 +504,7 @@ class RAGSystem:
         final_prompt = self.internal_promt_template.format(question=req.query)
         sampling_params = SamplingParams(temperature=0.3, top_p=0.95, repetition_penalty=1.1, max_tokens=200)
         answer_text = await self._generate_text(final_prompt, sampling_params)
-        self.logger.info(f"Generating remote answer...", extra={"request_id": request_id})
+        self.logger.info(f"[req: {request_id}] Generating remote answer...")
         return OutputAnswer(answer=answer_text)
 
     async def make_context_prediction(self, req: InputRagQuestion, request_id: str):
@@ -586,9 +583,9 @@ class RAGSystem:
         ]
 
         end_time = time.perf_counter()
-        self.logger.info(f"Init actions for request {request_id} done in {end_time - start_time:.6f}s", extra={"request_id": request_id})
+        self.logger.info(f"[req: {request_id}] Init actions for request {request_id} done in {end_time - start_time:.6f}s")
 
-        self.logger.info(f"Generating remote answer...", extra={"request_id": request_id})
+        self.logger.info(f"[req: {request_id}] Generating remote answer...")
         if not req.stream:
             final_answer = await self._generate_answer_external(rag_messages, max_tokens=4096, stream=False)
             return OutputAnswer(answer=final_answer)
