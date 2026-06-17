@@ -360,7 +360,7 @@ class Searcher:
             ),
             asyncio.to_thread(
                 #self.knowledgebase_collection.query.hybrid,
-                self.product_collections["knowledgebase"],
+                self.product_collections["knowledgebase"].query.hybrid,
                 query=query_text,
                 alpha=0.3,
                 limit=7,
@@ -368,7 +368,7 @@ class Searcher:
                 return_metadata=MetadataQuery(score=True),
             ),
             asyncio.to_thread(
-                self.product_collections["solutions"],
+                self.product_collections["solutions"].query.hybrid,
                 #self.solutions_collection.query.hybrid,
                 query=query_text,
                 alpha=0.3,
