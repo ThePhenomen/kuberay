@@ -24,7 +24,7 @@ import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    level="DEBUG",
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
@@ -379,7 +379,7 @@ class Searcher:
         )
         
         raw_objects = []
-        self.logger.debug(f"Found following docs: {product_name} - {res_main.len()}, knowledgebase - {res_knowledge_base.len()}, solutions - {res_solutions.len()}")
+        self.logger.info(f"Found following docs: {product_name} - {len(res_main)}, knowledgebase - {len(res_knowledge_base)}, solutions - {len(res_solutions)}")
         for res in (res_main, res_knowledge_base, res_solutions):
             for obj in res.objects or []:
                 raw_objects.append({
