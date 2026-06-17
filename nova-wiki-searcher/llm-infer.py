@@ -379,9 +379,13 @@ class Searcher:
         )
         
         raw_objects = []
-        self.logger.info(f"Found following docs: {product_name} - {len(res_main)}, knowledgebase - {len(res_knowledge_base)}, solutions - {len(res_solutions)}")
+        self.logger.info(
+            f"Found following docs: {product_name} - {len(res_main.objects)}, "
+            f"knowledgebase - {len(res_knowledge_base.objects)}, "
+            f"solutions - {len(res_solutions.objects)}"
+        )
         for res in (res_main, res_knowledge_base, res_solutions):
-            for obj in res.objects or []:
+            for obj in res.objects:
                 raw_objects.append({
                     "title": obj.properties.get("title", ""),
                     "page_content": obj.properties.get("page_content", ""),
