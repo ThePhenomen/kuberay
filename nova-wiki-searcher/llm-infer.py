@@ -316,18 +316,37 @@ class Searcher:
             self.weaviate_connection.close()
             raise RuntimeError("Weaviate is not ready, aborting Searcher initialization")
         
+        self.product_collections = {}
         for product in PRODUCTS:
-            product_alias = f"{COLLECTION_NAME}{str(product).replace('-', '_').capitalize()}"
-            attr_name = f"{str(product).replace('-', '_')}_collection"
-            setattr(
-                self,
-                attr_name,
-                self.weaviate_connection.collections.use(product_alias),
-            )
+            product_alias = f"{COLLECTION_NAME}{product.replace('-', '_').capitalize()}"
+            self.product_collections[product] = self.weaviate_connection.collections.use(product_alias)
+        # for product in PRODUCTS:
+        #     product_alias = f"{COLLECTION_NAME}{str(product).replace('-', '_').capitalize()}"
+        #     attr_name = f"{str(product).replace('-', '_')}_collection"
+        #     setattr(
+        #         self,
+        #         attr_name,
+        #         self.weaviate_connection.collections.use(product_alias),
+        #     )
+
+        # self.nova_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Nova")
+        # self.zvirt_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Zvirt")
+        # self.knowledgebase_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Knowledgebase")
+        # self.solutions_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Solutions")
 
     async def _fetch_docs_parallel(self, query_text: str, product_name: str, product_version: str, request_id: str) -> List[Dict[str, Any]]:
         collection = self.product_collections.get(product_name, self.nova_collection)
         version = "latest" if product_name == "zvirt" else product_name
+        # match product_name:
+        #     case "zvirt":
+        #         collection = self.zvirt_collection
+        #         version = "latest"
+        #     case "nova":
+        #         collection = self.nova_collection
+        #         version = product_name
+        #     case _:
+        #         collection = self.nova_collection
+        #         version = product_name
 
         self.logger.debug(f"[req: {request_id}] Execute remote document search")
         res_main, res_knowledge_base, res_solutions = await asyncio.gather(
@@ -340,7 +359,8 @@ class Searcher:
                 return_metadata=MetadataQuery(score=True),
             ),
             asyncio.to_thread(
-                self.knowledgebase_collection.query.hybrid,
+                #self.knowledgebase_collection.query.hybrid,
+                self.product_collections["knowledgebase"],
                 query=query_text,
                 alpha=0.3,
                 limit=7,
@@ -348,7 +368,8 @@ class Searcher:
                 return_metadata=MetadataQuery(score=True),
             ),
             asyncio.to_thread(
-                self.solutions_collection.query.hybrid,
+                self.product_collections["solutions"],
+                #self.solutions_collection.query.hybrid,
                 query=query_text,
                 alpha=0.3,
                 limit=7,
