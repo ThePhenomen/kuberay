@@ -335,7 +335,7 @@ class Searcher:
         # self.solutions_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Solutions")
 
     async def _fetch_docs_parallel(self, query_text: str, product_name: str, product_version: str, request_id: str) -> List[Dict[str, Any]]:
-        collection = self.product_collections.get(product_name, self.nova_collection)
+        collection = self.product_collections.get(product_name, "nova")
         version = "latest" if product_name == "zvirt" else product_name
         # match product_name:
         #     case "zvirt":
