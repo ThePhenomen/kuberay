@@ -348,7 +348,7 @@ class Searcher:
         #         collection = self.nova_collection
         #         version = product_name
 
-        self.logger.debug(f"[req: {request_id}] Execute remote document search")
+        self.logger.info(f"[req: {request_id}] Execute remote document search in db {product_name}")
         res_main, res_knowledge_base, res_solutions = await asyncio.gather(
             asyncio.to_thread(
                 collection.query.hybrid,
