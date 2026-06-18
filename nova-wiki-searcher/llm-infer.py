@@ -601,6 +601,55 @@ class RAGSystem:
         result = rewritten.strip()
         self.logger.info(f"Query rewrite: [{last_user_msg}] → [{result}]")
         return result or last_user_msg
+    
+    def _strip_thinking(self, text: str) -> str:
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    def _build_rag_messages_hybrid(
+        self,
+        history: List[Dict[str, Any]],
+        context: str,
+    ) -> List[Dict[str, str]]:
+        system_prompt = self.rag_answer_messages_template[0]["content"]
+
+        augmented_system = (
+            f"{system_prompt}\n\n"
+            f"## Relevant documentation\n"
+            f"<context>\n{context}\n</context>"
+        )
+
+        messages = [{"role": "system", "content": augmented_system}]
+
+        # История без последнего user-сообщения, не более 6 реплик
+        past_messages = history[-7:-1]
+
+        # Дедупликация подряд идущих дублей
+        deduped = []
+        prev_key = None
+        for m in past_messages:
+            key = (m.get("role"), (m.get("content") or "").strip())
+            if key != prev_key:
+                deduped.append(m)
+                prev_key = key
+
+        for m in deduped:
+            role = m.get("role", "")
+            content = (m.get("content") or "").strip()
+            if not content or role not in ("user", "assistant"):
+                continue
+            if role == "assistant":
+                content = self._strip_thinking(content)
+            if content:
+                messages.append({"role": role, "content": content})
+
+        # Последний вопрос — чистый, контекст уже в system
+        last_user = next(
+            (m["content"] for m in reversed(history) if m.get("role") == "user"), ""
+        )
+        messages.append({"role": "user", "content": last_user})
+
+        self.logger.debug(f"Built RAG messages: {len(messages)} total (1 system + {len(messages)-2} history + 1 user)")
+        return messages
 
     async def make_context_prediction(self, req: InputRagQuestion, request_id: str):
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
@@ -673,14 +722,19 @@ class RAGSystem:
                 return empty_stream()
             return OutputAnswer(answer="Не смог найти подходящую информацию на Ваш вопрос.")
 
+        # texts_with_links = [f"{doc['page_content']}\n\nИсточник: {doc['page_url']}" for doc in reranked_docs]
+        # context = "\n\n---\n\n".join(texts_with_links)
+
+        # rag_messages = [
+        #     {"role": item["role"], "content": item["content"].format(question=req.query, context=context)}
+        #     for item in self.rag_answer_messages_template
+        # ]
+
+        # СТАЛО:
         texts_with_links = [f"{doc['page_content']}\n\nИсточник: {doc['page_url']}" for doc in reranked_docs]
         context = "\n\n---\n\n".join(texts_with_links)
 
-        rag_messages = [
-            {"role": item["role"], "content": item["content"].format(question=req.query, context=context)}
-            for item in self.rag_answer_messages_template
-        ]
-
+        rag_messages = self._build_rag_messages_hybrid(req.query, context)
         self.logger.info(f"[req: {request_id}] Raw messages: {rag_messages}")
 
         end_time = time.perf_counter()
