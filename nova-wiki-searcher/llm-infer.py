@@ -9,7 +9,7 @@ import httpx
 import re
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from ray import serve
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -555,7 +555,7 @@ class RAGSystem:
         if not history_lines:
             return last_user_msg
         
-        self.logger.info(f"History: {history_lines}")
+        self.logger.debug(f"History: {history_lines}")
 
         history_text = "\n".join(history_lines)
 
@@ -598,7 +598,7 @@ class RAGSystem:
             rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50)
         )
         result = rewritten.strip()
-        self.logger.info(f"Query rewrite: [{last_user_msg}] → [{result}]")
+        self.logger.debug(f"Query rewrite: [{last_user_msg}] → [{result}]")
         return result or last_user_msg
     
     def _strip_thinking(self, text: str) -> str:
@@ -650,8 +650,8 @@ class RAGSystem:
     async def make_context_prediction(self, req: InputRagQuestion, request_id: str):
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
 
-        self.logger.info(f"[req: {request_id}] Input request: {req.query}")
-        self.logger.info(f"[req: {request_id}] Last user message: {last_user_msg}")
+        self.logger.debug(f"[req: {request_id}] Input request: {req.query}")
+        self.logger.debug(f"[req: {request_id}] Last user message: {last_user_msg}")
         
         start_time = time.perf_counter()
 
