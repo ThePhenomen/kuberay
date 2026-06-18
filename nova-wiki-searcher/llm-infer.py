@@ -539,6 +539,8 @@ class RAGSystem:
                 history_lines.append(f"Пользователь: {content[:300]}")
             elif role == "assistant":
                 history_lines.append(f"Ассистент: {content[:200]}")
+        
+        self.logger.info(f"History: {history_lines}")
 
         history_text = "\n".join(history_lines)
 
