@@ -320,33 +320,10 @@ class Searcher:
         for product in PRODUCTS:
             product_alias = f"{COLLECTION_NAME}{product.replace('-', '_').capitalize()}"
             self.product_collections[product] = self.weaviate_connection.collections.use(product_alias)
-        # for product in PRODUCTS:
-        #     product_alias = f"{COLLECTION_NAME}{str(product).replace('-', '_').capitalize()}"
-        #     attr_name = f"{str(product).replace('-', '_')}_collection"
-        #     setattr(
-        #         self,
-        #         attr_name,
-        #         self.weaviate_connection.collections.use(product_alias),
-        #     )
-
-        # self.nova_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Nova")
-        # self.zvirt_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Zvirt")
-        # self.knowledgebase_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Knowledgebase")
-        # self.solutions_collection = self.weaviate_connection.collections.use(f"{COLLECTION_NAME}Solutions")
 
     async def _fetch_docs_parallel(self, query_text: str, product_name: str, product_version: str, request_id: str) -> List[Dict[str, Any]]:
-        collection = self.product_collections.get(product_name, "nova")
+        collection = self.product_collections.get(product_name) or self.product_collections["nova"]
         version = "latest" if product_name == "zvirt" else product_name
-        # match product_name:
-        #     case "zvirt":
-        #         collection = self.zvirt_collection
-        #         version = "latest"
-        #     case "nova":
-        #         collection = self.nova_collection
-        #         version = product_name
-        #     case _:
-        #         collection = self.nova_collection
-        #         version = product_name
 
         self.logger.info(f"[req: {request_id}] Execute remote document search in db {product_name}")
         res_main, res_knowledge_base, res_solutions = await asyncio.gather(
@@ -359,7 +336,6 @@ class Searcher:
                 return_metadata=MetadataQuery(score=True),
             ),
             asyncio.to_thread(
-                #self.knowledgebase_collection.query.hybrid,
                 self.product_collections["knowledgebase"].query.hybrid,
                 query=query_text,
                 alpha=0.3,
@@ -369,7 +345,6 @@ class Searcher:
             ),
             asyncio.to_thread(
                 self.product_collections["solutions"].query.hybrid,
-                #self.solutions_collection.query.hybrid,
                 query=query_text,
                 alpha=0.3,
                 limit=7,
@@ -546,6 +521,9 @@ class RAGSystem:
 
     async def make_context_prediction(self, req: InputRagQuestion, request_id: str):
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
+
+        self.logger.info(f"[req: {request_id}] Input request: {req.query}")
+        self.logger.info(f"[req: {request_id}] Last user message: {last_user_msg}")
         
         start_time = time.perf_counter()
         if len(req.query) <= 1 or len(last_user_msg.split()) > 15:
@@ -658,6 +636,8 @@ class SmartRouter:
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created_time = int(time.time())
+
+        print(f"[{request_id}] Got query: {messages}")
 
         if stream:
             if user_request:
