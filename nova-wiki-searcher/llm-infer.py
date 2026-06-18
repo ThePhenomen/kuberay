@@ -6,6 +6,7 @@ import math
 import time
 import torch
 import httpx
+import re
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -523,22 +524,37 @@ class RAGSystem:
     
     async def _compress_history(self, messages: List[Dict[str, Any]]) -> str:
 
-        history = messages[-6:-1]  # всё кроме последнего сообщения пользователя
         last_user_msg = next(
             (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
         )
 
-        if not history or len(last_user_msg.split()) > 15:
+        history = messages[-7:-1]
+        if not history:
+            return last_user_msg
+
+        last_words = last_user_msg.split()
+        if len(last_words) > 20:
             return last_user_msg
 
         history_lines = []
         for m in history:
             role = m.get("role", "")
             content = m.get("content", "")
+            if not content:
+                continue
+
             if role == "user":
-                history_lines.append(f"Пользователь: {content[:300]}")
+                snippet = content[:400] if len(content) > 400 else content
+                history_lines.append(f"User: {snippet}")
+
             elif role == "assistant":
-                history_lines.append(f"Ассистент: {content[:200]}")
+                clean = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                snippet = clean[:250] if len(clean) > 400 else clean
+                if snippet:
+                    history_lines.append(f"Assistant: {snippet}")
+
+        if not history_lines:
+            return last_user_msg
         
         self.logger.info(f"History: {history_lines}")
 
@@ -548,16 +564,22 @@ class RAGSystem:
             {
                 "role": "system",
                 "content": (
-                    "You are a search query transformation system.\n"
-                    "You will receive a conversation between a user and an assistant, "
-                    "followed by the user's latest question.\n"
+                    "You are a search query transformation system for a technical documentation assistant.\n"
+                    "You will receive a conversation (user questions and assistant answers), "
+                    "followed by the user's latest question.\n\n"
                     "Rules:\n"
-                    "1. If the latest question uses pronouns (he, it, this) or continues "
-                    "   the previous topic, rewrite it by incorporating specific terms from "
-                    "   BOTH the user's questions AND the assistant's answers in the history.\n"
-                    "2. If the latest question starts a COMPLETELY NEW TOPIC, return it as-is.\n"
-                    "3. Output ONLY the final query — no quotes, no explanations, no greetings.\n"
-                    "4. Keep it short and precise (max 20 words)."
+                    "1. TOPIC CONTINUATION — if the latest question uses pronouns (it, this, they, there), "
+                    "   refers to something mentioned before, or is clearly a follow-up: "
+                    "   rewrite it into a precise standalone search query, "
+                    "   incorporating relevant technical terms from BOTH user questions AND assistant answers.\n"
+                    "2. NEW TOPIC — if the latest question starts a completely unrelated topic: "
+                    "   return it exactly as-is, do not modify.\n"
+                    "3. QUERY QUALITY — the output must be a good documentation search query: "
+                    "   specific, technical, free of conversational filler. "
+                    "   Preserve key product names, component names, and action verbs. "
+                    "   Do not over-compress — it is fine to use 10-25 words if needed for clarity.\n"
+                    "4. OUTPUT FORMAT — output ONLY the final search query. "
+                    "   No quotes, no explanations, no prefixes like 'Query:'."
                 ),
             },
             {
@@ -576,7 +598,9 @@ class RAGSystem:
         rewritten = await self._generate_text(
             rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50)
         )
-        return rewritten.strip() or last_user_msg
+        result = rewritten.strip()
+        self.logger.info(f"Query rewrite: [{last_user_msg}] → [{result}]")
+        return result or last_user_msg
 
     async def make_context_prediction(self, req: InputRagQuestion, request_id: str):
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
@@ -615,8 +639,6 @@ class RAGSystem:
         #     search_query = rewritten_result.strip()
 
         search_query = await self._compress_history(req.query)
-        self.logger.info(f"[req: {request_id}] Rewritten request: {req.query}")
-
         hyde_prompt = (
             f"<|im_start|>system\n"
             f"You are an expert IT assistant. "
