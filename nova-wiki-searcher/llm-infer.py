@@ -577,7 +577,7 @@ class RAGSystem:
                     "3. QUERY QUALITY — the output must be a good documentation search query: "
                     "   specific, technical, free of conversational filler. "
                     "   Preserve key product names, component names, and action verbs. "
-                    "   Do not over-compress — it is fine to use 10-25 words if needed for clarity.\n"
+                    "   Do not over-compress — it is fine to use 20-30 words if needed for clarity.\n"
                     "4. OUTPUT FORMAT — output ONLY the final search query. "
                     "   No quotes, no explanations, no prefixes like 'Query:'."
                 ),
@@ -680,6 +680,8 @@ class RAGSystem:
             {"role": item["role"], "content": item["content"].format(question=req.query, context=context)}
             for item in self.rag_answer_messages_template
         ]
+
+        self.logger.info(f"[req: {request_id}] Raw messages: {rag_messages}")
 
         end_time = time.perf_counter()
         self.logger.info(f"[req: {request_id}] Init actions for request {request_id} done in {end_time - start_time:.6f}s")
