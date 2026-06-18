@@ -249,7 +249,6 @@ class Reranker:
 
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 rerank_scores = self.model(**inputs).logits.view(-1).float().tolist()
-                #rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
 
         self.logger.debug(f"[req: {request_id}] Raw rerank scores computed, calucalted scores: {rerank_scores}")
 
@@ -620,10 +619,8 @@ class RAGSystem:
 
         messages = [{"role": "system", "content": augmented_system}]
 
-        # История без последнего user-сообщения, не более 6 реплик
         past_messages = history[-7:-1]
 
-        # Дедупликация подряд идущих дублей
         deduped = []
         prev_key = None
         for m in past_messages:
@@ -642,7 +639,6 @@ class RAGSystem:
             if content:
                 messages.append({"role": role, "content": content})
 
-        # Последний вопрос — чистый, контекст уже в system
         last_user = next(
             (m["content"] for m in reversed(history) if m.get("role") == "user"), ""
         )
@@ -658,34 +654,6 @@ class RAGSystem:
         self.logger.info(f"[req: {request_id}] Last user message: {last_user_msg}")
         
         start_time = time.perf_counter()
-        # if len(req.query) <= 1 or len(last_user_msg.split()) > 15:
-        #     search_query = last_user_msg
-        # else:
-        #     history_msgs = req.query[-4:-1]
-        #     history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_msgs])
-        #     rewrite_prompt_messages = [
-        #         {
-        #             "role": "system",
-        #             "content": (
-        #                 "You are a search query transformation system. Your task is to formulate a text for documentation search.\n"
-        #                 "Rules:\n"
-        #                 "1. Analyze the user's latest question. If it contains pronouns (he, it, this, there) or "
-        #                 "logically continues the previous topic, rewrite it by adding specifics from the conversation history.\n"
-        #                 "2. IMPORTANT: If the latest question starts a COMPLETELY NEW TOPIC unrelated to the history, "
-        #                 "SIMPLY RETURN the latest question as is. Do not drag in terms from the old topic!\n"
-        #                 "3. Output ONLY the final query text without quotes, explanations, or greetings. It should be small and precise, describing meaning of the topic. Do not answer the question itself."
-        #             ),
-        #         },
-        #         {
-        #             "role": "user",
-        #             "content": f"Conversation history:\n{history_text}\n\nLatest question: {last_user_msg}\n\nFinal search query:",
-        #         },
-        #     ]
-        #     rewrite_prompt = self.tokenizer.apply_chat_template(
-        #         rewrite_prompt_messages, tokenize=False, add_generation_prompt=True,
-        #     )
-        #     rewritten_result = await self._generate_text(rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50))
-        #     search_query = rewritten_result.strip()
 
         search_query = await self._compress_history(req.query)
         hyde_prompt = (
@@ -722,15 +690,6 @@ class RAGSystem:
                 return empty_stream()
             return OutputAnswer(answer="Не смог найти подходящую информацию на Ваш вопрос.")
 
-        # texts_with_links = [f"{doc['page_content']}\n\nИсточник: {doc['page_url']}" for doc in reranked_docs]
-        # context = "\n\n---\n\n".join(texts_with_links)
-
-        # rag_messages = [
-        #     {"role": item["role"], "content": item["content"].format(question=req.query, context=context)}
-        #     for item in self.rag_answer_messages_template
-        # ]
-
-        # СТАЛО:
         texts_with_links = [f"{doc['page_content']}\n\nИсточник: {doc['page_url']}" for doc in reranked_docs]
         context = "\n\n---\n\n".join(texts_with_links)
 
