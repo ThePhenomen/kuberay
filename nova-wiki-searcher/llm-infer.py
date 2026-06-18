@@ -246,7 +246,9 @@ class Reranker:
                 return_tensors="pt"
             ).to(device)
 
-            rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                rerank_scores = self.model(**inputs).logits.view(-1).float().tolist()
+                #rerank_scores = self.model(**inputs, return_dict=True).logits.view(-1,).float().tolist()
 
         self.logger.debug(f"[req: {request_id}] Raw rerank scores computed, calucalted scores: {rerank_scores}")
 
@@ -518,6 +520,61 @@ class RAGSystem:
         answer_text = await self._generate_text(final_prompt, sampling_params)
         self.logger.info(f"[req: {request_id}] Generating remote answer...")
         return OutputAnswer(answer=answer_text)
+    
+    async def _compress_history(self, messages: List[Dict[str, Any]]) -> str:
+
+        history = messages[-6:-1]  # всё кроме последнего сообщения пользователя
+        last_user_msg = next(
+            (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
+        )
+
+        if not history or len(last_user_msg.split()) > 15:
+            return last_user_msg
+
+        history_lines = []
+        for m in history:
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if role == "user":
+                history_lines.append(f"Пользователь: {content[:300]}")
+            elif role == "assistant":
+                history_lines.append(f"Ассистент: {content[:200]}")
+
+        history_text = "\n".join(history_lines)
+
+        rewrite_prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a search query transformation system.\n"
+                    "You will receive a conversation between a user and an assistant, "
+                    "followed by the user's latest question.\n"
+                    "Rules:\n"
+                    "1. If the latest question uses pronouns (he, it, this) or continues "
+                    "   the previous topic, rewrite it by incorporating specific terms from "
+                    "   BOTH the user's questions AND the assistant's answers in the history.\n"
+                    "2. If the latest question starts a COMPLETELY NEW TOPIC, return it as-is.\n"
+                    "3. Output ONLY the final query — no quotes, no explanations, no greetings.\n"
+                    "4. Keep it short and precise (max 20 words)."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Conversation history:\n{history_text}\n\n"
+                    f"Latest question: {last_user_msg}\n\n"
+                    f"Final search query:"
+                ),
+            },
+        ]
+
+        rewrite_prompt = self.tokenizer.apply_chat_template(
+            rewrite_prompt_messages, tokenize=False, add_generation_prompt=True,
+        )
+        rewritten = await self._generate_text(
+            rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50)
+        )
+        return rewritten.strip() or last_user_msg
 
     async def make_context_prediction(self, req: InputRagQuestion, request_id: str):
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
@@ -526,34 +583,37 @@ class RAGSystem:
         self.logger.info(f"[req: {request_id}] Last user message: {last_user_msg}")
         
         start_time = time.perf_counter()
-        if len(req.query) <= 1 or len(last_user_msg.split()) > 15:
-            search_query = last_user_msg
-        else:
-            history_msgs = req.query[-4:-1]
-            history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_msgs])
-            rewrite_prompt_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a search query transformation system. Your task is to formulate a text for documentation search.\n"
-                        "Rules:\n"
-                        "1. Analyze the user's latest question. If it contains pronouns (he, it, this, there) or "
-                        "logically continues the previous topic, rewrite it by adding specifics from the conversation history.\n"
-                        "2. IMPORTANT: If the latest question starts a COMPLETELY NEW TOPIC unrelated to the history, "
-                        "SIMPLY RETURN the latest question as is. Do not drag in terms from the old topic!\n"
-                        "3. Output ONLY the final query text without quotes, explanations, or greetings. It should be small and precise, describing meaning of the topic. Do not answer the question itself."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Conversation history:\n{history_text}\n\nLatest question: {last_user_msg}\n\nFinal search query:",
-                },
-            ]
-            rewrite_prompt = self.tokenizer.apply_chat_template(
-                rewrite_prompt_messages, tokenize=False, add_generation_prompt=True,
-            )
-            rewritten_result = await self._generate_text(rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50))
-            search_query = rewritten_result.strip()
+        # if len(req.query) <= 1 or len(last_user_msg.split()) > 15:
+        #     search_query = last_user_msg
+        # else:
+        #     history_msgs = req.query[-4:-1]
+        #     history_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_msgs])
+        #     rewrite_prompt_messages = [
+        #         {
+        #             "role": "system",
+        #             "content": (
+        #                 "You are a search query transformation system. Your task is to formulate a text for documentation search.\n"
+        #                 "Rules:\n"
+        #                 "1. Analyze the user's latest question. If it contains pronouns (he, it, this, there) or "
+        #                 "logically continues the previous topic, rewrite it by adding specifics from the conversation history.\n"
+        #                 "2. IMPORTANT: If the latest question starts a COMPLETELY NEW TOPIC unrelated to the history, "
+        #                 "SIMPLY RETURN the latest question as is. Do not drag in terms from the old topic!\n"
+        #                 "3. Output ONLY the final query text without quotes, explanations, or greetings. It should be small and precise, describing meaning of the topic. Do not answer the question itself."
+        #             ),
+        #         },
+        #         {
+        #             "role": "user",
+        #             "content": f"Conversation history:\n{history_text}\n\nLatest question: {last_user_msg}\n\nFinal search query:",
+        #         },
+        #     ]
+        #     rewrite_prompt = self.tokenizer.apply_chat_template(
+        #         rewrite_prompt_messages, tokenize=False, add_generation_prompt=True,
+        #     )
+        #     rewritten_result = await self._generate_text(rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50))
+        #     search_query = rewritten_result.strip()
+
+        search_query = await self._compress_history(req.query)
+        self.logger.info(f"[req: {request_id}] Rewritten request: {req.query}")
 
         hyde_prompt = (
             f"<|im_start|>system\n"
