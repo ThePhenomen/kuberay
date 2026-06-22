@@ -726,7 +726,6 @@ class SmartRouter:
         }
     
     @app.post("/v1/chat/completions")
-    @mlflow.trace
     async def chat_completions(self, request: Request):
         body: Dict[str, Any] = await request.json()
         model = body.get("model", "wiki-searcher")
@@ -739,46 +738,107 @@ class SmartRouter:
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created_time = int(time.time())
 
-        print(f"[{request_id}] Got query: {messages}")
+        self.logger.info(f"[{request_id}] Got query: {messages}")
 
-        mlflow.update_current_trace(
-            tags={
+        trace_inputs = {
+            "request_id": request_id,
+            "model": model,
+            "messages": messages,
+            "product_name": product_name,
+            "product_version": product_version,
+            "user_request": user_request,
+            "stream": stream,
+        }
+
+        if stream and user_request:
+            req = InputRagQuestion(
+                query=messages,
+                product_name=product_name,
+                product_version=product_version,
+                stream=True,
+            )
+            resp_gen = self.rag.options(stream=True).make_context_prediction.remote(req, request_id)
+
+            async def passthrough_sse():
+                span = mlflow.start_span_no_context(name="chat_completions_stream", span_type="CHAIN")
+                span.set_inputs(trace_inputs)
+                span.set_attributes({
+                    "environment": "dev",
+                    "endpoint": "/v1/chat/completions",
+                })
+
+                chunks = []
+                disconnected = False
+
+                try:
+                    async for chunk in resp_gen:
+                        if await request.is_disconnected():
+                            disconnected = True
+                            break
+
+                        raw = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+
+                        try:
+                            text = raw.decode("utf-8", errors="replace")
+                            if text.startswith("data: ") and text.strip() != "data: [DONE]":
+                                import json
+                                payload = json.loads(text[6:])
+                                delta = payload.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                if delta:
+                                    chunks.append(delta)
+                        except Exception:
+                            pass
+
+                        yield raw
+
+                    if disconnected:
+                        span.set_outputs({"status": "client_disconnected", "partial_content": "".join(chunks)})
+                    else:
+                        span.set_outputs({"status": "ok", "content": "".join(chunks), "chunks_count": len(chunks)})
+
+                except Exception as e:
+                    span.set_status("ERROR")
+                    span.set_outputs({"status": "error", "error": str(e), "partial_content": "".join(chunks)})
+                    raise
+                finally:
+                    span.end()
+
+            return StreamingResponse(
+                passthrough_sse(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        with mlflow.start_span(name="chat_completions", span_type="CHAIN") as span:
+            span.set_inputs(trace_inputs)
+            span.set_attributes({
                 "environment": "dev",
-                "request_id": request_id,
-                "product_name": product_name,
-                "product_version": product_version,
-                "user_request": user_request,
-            },
-        )
+                "endpoint": "/v1/chat/completions",
+            })
 
-        if stream:
             if user_request:
                 req = InputRagQuestion(
-                    query=messages, product_name=product_name, product_version=product_version, stream=True,
+                    query=messages,
+                    product_name=product_name,
+                    product_version=product_version,
+                    stream=False,
                 )
-                resp_gen = self.rag.options(stream=True).make_context_prediction.remote(req, request_id)
+                resp = await self.rag.make_context_prediction.remote(req, request_id)
+            else:
+                req = InputQuestion(query=messages, stream=False)
+                resp = await self.rag.make_prediction.remote(req, request_id)
 
-                async def passthrough_sse():
-                    try:
-                        async for chunk in resp_gen:
-                            if await request.is_disconnected(): break
-                            yield chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
-                    except asyncio.CancelledError: return
-
-                return StreamingResponse(
-                    passthrough_sse(), media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-                )
-            
-        if user_request:
-            req = InputRagQuestion(query=messages, product_name=product_name, product_version=product_version, stream=False)
-            resp = await self.rag.make_context_prediction.remote(req, request_id)
-        else:
-            req = InputQuestion(query=messages, stream=False)
-            resp = await self.rag.make_prediction.remote(req, request_id)
+            span.set_outputs({"answer": resp.answer})
 
         return ChatCompletionResponse(
-            id=request_id, object="chat.completion", created=created_time, model=model,
+            id=request_id,
+            object="chat.completion",
+            created=created_time,
+            model=model,
             choices=[
                 ChatCompletionResponseChoice(
                     index=0,
