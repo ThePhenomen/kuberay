@@ -742,13 +742,12 @@ class SmartRouter:
         print(f"[{request_id}] Got query: {messages}")
 
         mlflow.update_current_trace(
-            request_id=request_id,
-            model=model,
-            product_name=product_name,
-            product_version=product_version,
-            user_request=user_request,
             tags={
-                "environment": "production"
+                "environment": "dev",
+                "request_id": request_id,
+                "product_name": product_name,
+                "product_version": product_version,
+                "user_request": user_request,
             },
         )
 
