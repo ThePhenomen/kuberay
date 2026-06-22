@@ -738,8 +738,6 @@ class SmartRouter:
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created_time = int(time.time())
 
-        self.logger.info(f"[{request_id}] Got query: {messages}")
-
         trace_inputs = {
             "request_id": request_id,
             "model": model,
