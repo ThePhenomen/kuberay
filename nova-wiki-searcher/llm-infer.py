@@ -21,6 +21,8 @@ import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, MetadataQuery
 
+import mlflow
+
 import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -724,6 +726,7 @@ class SmartRouter:
         }
     
     @app.post("/v1/chat/completions")
+    @mlflow.trace
     async def chat_completions(self, request: Request):
         body: Dict[str, Any] = await request.json()
         model = body.get("model", "wiki-searcher")
@@ -737,6 +740,17 @@ class SmartRouter:
         created_time = int(time.time())
 
         print(f"[{request_id}] Got query: {messages}")
+
+        mlflow.update_current_trace(
+            request_id=request_id,
+            model=model,
+            product_name=product_name,
+            product_version=product_version,
+            user_request=user_request,
+            tags={
+                "environment": "production"
+            },
+        )
 
         if stream:
             if user_request:
