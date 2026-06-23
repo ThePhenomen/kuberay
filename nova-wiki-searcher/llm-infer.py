@@ -671,10 +671,10 @@ class SmartRouter:
             resp_gen = self.rag.options(stream=True).make_context_prediction.remote(req, request_id)
 
             async def passthrough_sse():
-                span = mlflow.start_span_no_context(name="chat_completions_stream", span_type="CHAIN")
+                span = mlflow.start_span_no_context(name="chat_completions_stream", span_type="RETRIEVER")
                 span.set_inputs(trace_inputs)
                 span.set_attributes({
-                    "environment": "dev",
+                    "environment": "staging",
                     "endpoint": "/v1/chat/completions",
                 })
 
@@ -724,10 +724,10 @@ class SmartRouter:
                 },
             )
 
-        with mlflow.start_span(name="chat_completions", span_type="CHAIN") as span:
+        with mlflow.start_span(name="chat_completions", span_type="RETRIEVER") as span:
             span.set_inputs(trace_inputs)
             span.set_attributes({
-                "environment": "dev",
+                "environment": "staging",
                 "endpoint": "/v1/chat/completions",
             })
 
