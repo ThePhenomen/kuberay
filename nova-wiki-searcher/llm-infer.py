@@ -459,7 +459,7 @@ class RAGSystem:
         self.logger.info(f"[req: {request_id}] Generating remote answer...")
         return OutputAnswer(answer=answer_text)
     
-    async def _compress_history(self, messages: List[Dict[str, Any]]) -> str:
+    async def _compress_history(self, messages: List[Dict[str, Any]], request_id: str) -> str:
 
         last_user_msg = next(
             (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
@@ -493,13 +493,13 @@ class RAGSystem:
         if not history_lines:
             return last_user_msg
         
-        self.logger.debug(f"History: {history_lines}")
+        self.logger.debug(f"[req: {request_id}] History: {history_lines}")
 
         history_text = "\n".join(history_lines)
 
         rewrite_prompt_messages = self.rewrite_prompt_messages.format(history_text=history_text, last_user_msg=last_user_msg)
-        self.logger.info(f"Promt for messages to rewrite: {rewrite_prompt_messages}")
-        
+        self.logger.info(f"[req: {request_id}] Promt for messages to rewrite: {rewrite_prompt_messages}")
+
         rewrite_prompt = self.tokenizer.apply_chat_template(
             rewrite_prompt_messages, tokenize=False, add_generation_prompt=True,
         )
@@ -507,7 +507,7 @@ class RAGSystem:
             rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50)
         )
         result = rewritten.strip()
-        self.logger.debug(f"Query rewrite: [{last_user_msg}] → [{result}]")
+        self.logger.info(f"[req: {request_id}] Query rewrite: [{last_user_msg}] → [{result}]")
         return result or last_user_msg
     
     def _strip_thinking(self, text: str) -> str:
@@ -564,7 +564,7 @@ class RAGSystem:
         
         start_time = time.perf_counter()
 
-        search_query = await self._compress_history(req.query)
+        search_query = await self._compress_history(req.query, request_id)
         hyde_prompt = (
             f"<|im_start|>system\n"
             f"You are an expert IT assistant. "
@@ -603,7 +603,7 @@ class RAGSystem:
         context = "\n\n---\n\n".join(texts_with_links)
 
         rag_messages = self._build_rag_messages_hybrid(req.query, context)
-        self.logger.info(f"[req: {request_id}] Raw messages: {rag_messages}")
+        self.logger.debug(f"[req: {request_id}] Raw messages: {rag_messages}")
 
         end_time = time.perf_counter()
         self.logger.info(f"[req: {request_id}] Init actions for request {request_id} done in {end_time - start_time:.6f}s")
