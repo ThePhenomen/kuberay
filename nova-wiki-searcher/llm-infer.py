@@ -497,11 +497,17 @@ class RAGSystem:
 
         history_text = "\n".join(history_lines)
 
-        rewrite_prompt_messages = self.rewrite_prompt_messages.format(history_text=history_text, last_user_msg=last_user_msg)
-        self.logger.info(f"[req: {request_id}] Promt for messages to rewrite: {rewrite_prompt_messages}")
+        filled_messages = [
+            {
+                "role": m["role"],
+                "content": m["content"].format(history_text=history_text, last_user_msg=last_user_msg),
+            }
+            for m in self.rewrite_prompt_messages
+        ]
+        self.logger.info(f"[req: {request_id}] Promt for messages to rewrite: {filled_messages}")
 
         rewrite_prompt = self.tokenizer.apply_chat_template(
-            rewrite_prompt_messages, tokenize=False, add_generation_prompt=True,
+            filled_messages, tokenize=False, add_generation_prompt=True,
         )
         rewritten = await self._generate_text(
             rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50)
