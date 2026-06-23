@@ -380,6 +380,9 @@ class RAGSystem:
         self.rewrite_prompt_messages = mlflow.genai.load_prompt("prompts:/rewrite_messages_prompt/1").to_single_brace_format()
         self.logger.info(f"Promt for rewriting chat history: {self.rewrite_prompt_messages}")
 
+        self.hyde_prompt_messages = mlflow.genai.load_prompt("prompts:/hyde_prompt/1").to_single_brace_format()
+        self.logger.info(f"HyDE prompt loaded: {self.hyde_prompt_messages}")
+
         if not RAG_EXTERNAL_LLM_ENDPOINT:
             raise RuntimeError("RAG_EXTERNAL_LLM_ENDPOINT is not set")
 
@@ -504,8 +507,6 @@ class RAGSystem:
             }
             for m in self.rewrite_prompt_messages
         ]
-        self.logger.info(f"[req: {request_id}] Promt for messages to rewrite: {filled_messages}")
-
         rewrite_prompt = self.tokenizer.apply_chat_template(
             filled_messages, tokenize=False, add_generation_prompt=True,
         )
@@ -513,7 +514,7 @@ class RAGSystem:
             rewrite_prompt, SamplingParams(temperature=0.0, max_tokens=50)
         )
         result = rewritten.strip()
-        self.logger.info(f"[req: {request_id}] Query rewrite: [{last_user_msg}] → [{result}]")
+        self.logger.debug(f"[req: {request_id}] Query rewrite: [{last_user_msg}] → [{result}]")
         return result or last_user_msg
     
     def _strip_thinking(self, text: str) -> str:
@@ -571,22 +572,21 @@ class RAGSystem:
         start_time = time.perf_counter()
 
         search_query = await self._compress_history(req.query, request_id)
-        hyde_prompt = (
-            f"<|im_start|>system\n"
-            f"You are an expert IT assistant. "
-            f"Answer the user's query with one short technical paragraph. "
-            f"Use only essential information, no introductions, no conclusions, no greetings, "
-            f"no lists, no code blocks, no Markdown formatting. "
-            f"If the query mentions operating systems or distributions, "
-            f"mention only OS family names without version numbers "
-            f"(for example: Redos, Almalinux, Astra, Alt, MosOS, CentOS, Ubuntu). "
-            f"Never write specific version numbers or minor releases. "
-            f"Maximum 60 words. Answer in Russian.\n"
-            f"<|im_end|>\n"
-            f"<|im_start|>user\nQuery: {search_query}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
+        filled_hyde_messages = [
+            {
+                "role": m["role"],
+                "content": m["content"].format(search_query=search_query),
+            }
+            for m in self.hyde_prompt_messages
+        ]
+        hyde_prompt = self.tokenizer.apply_chat_template(
+            filled_hyde_messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
-        h_doc = await self._generate_text(hyde_prompt, SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=80))
+        h_doc = await self._generate_text(
+            hyde_prompt, SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=80)
+        )
 
         queries_to_search = [search_query, h_doc]
         reranked_docs = await self.searcher.search.remote(
