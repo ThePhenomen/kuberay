@@ -22,6 +22,7 @@ from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, MetadataQuery
 
 import mlflow
+from mlflow.entities import Document
 
 import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -351,9 +352,15 @@ class Searcher:
             main_query = queries[0]
             reranked_docs = await self.reranker.rerank.remote(main_query, request_id, raw_docs, top_k=top_k, alpha=alpha)
 
-            retrieved_texts = [doc.get("page_content", "") for doc in reranked_docs]
-            span.set_outputs(retrieved_texts)
-            
+            span.set_outputs([
+                Document(
+                    id=doc.get("source", str(i)),
+                    page_content=doc.get("page_content", ""),
+                    metadata={"url": doc.get("page_url", ""), "score": doc.get("combined_score", 0.0)}
+                )
+                for i, doc in enumerate(reranked_docs)
+            ])
+
             return reranked_docs
 
     def close(self):
