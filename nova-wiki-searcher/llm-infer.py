@@ -316,7 +316,7 @@ class Searcher:
         with mlflow.start_span(name="document_search", span_type="RETRIEVER") as span:
             
             span.set_inputs({
-                "queries": queries,
+                "queries": queries[0],
                 "product_name": product_name,
                 "product_version": product_version,
                 "top_k": top_k,
