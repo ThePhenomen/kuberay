@@ -312,29 +312,49 @@ class Searcher:
         top_k: int = 5,
         alpha: float = 0.7
     ) -> List[Dict[str, Any]]:
-        docs_start_time = time.perf_counter()
-        
-        tasks = [self._fetch_docs_parallel(q, product_name, product_version, request_id) for q in queries]
-        all_docs_lists = await asyncio.gather(*tasks)
+        with mlflow.start_span(name="document_search", span_type="RETRIEVER") as span:
+            
+            span.set_inputs({
+                "queries": queries,
+                "product_name": product_name,
+                "product_version": product_version,
+                "top_k": top_k,
+                "alpha": alpha
+            })
 
-        seen_urls = set()
-        raw_docs = []
-        for docs in all_docs_lists:
-            for doc in docs:
-                url = doc.get("source")
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    raw_docs.append(doc)
+            span.set_attributes({
+                "product": product_name,
+                "version": product_version,
+                "request_id": request_id
+            })
+            
+            docs_start_time = time.perf_counter()
+            
+            tasks = [self._fetch_docs_parallel(q, product_name, product_version, request_id) for q in queries]
+            all_docs_lists = await asyncio.gather(*tasks)
 
-        docs_end_time = time.perf_counter()
-        self.logger.info(f"[req: {request_id}] Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s")
+            seen_urls = set()
+            raw_docs = []
+            for docs in all_docs_lists:
+                for doc in docs:
+                    url = doc.get("source")
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        raw_docs.append(doc)
 
-        if not raw_docs:
-            return []
+            docs_end_time = time.perf_counter()
+            self.logger.info(f"[req: {request_id}] Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s")
 
-        main_query = queries[0]
-        reranked_docs = await self.reranker.rerank.remote(main_query, request_id, raw_docs, top_k=top_k, alpha=alpha)
-        return reranked_docs
+            if not raw_docs:
+                return []
+
+            main_query = queries[0]
+            reranked_docs = await self.reranker.rerank.remote(main_query, request_id, raw_docs, top_k=top_k, alpha=alpha)
+
+            retrieved_texts = [doc.get("page_content", "") for doc in reranked_docs]
+            span.set_outputs(retrieved_texts)
+            
+            return reranked_docs
 
     def close(self):
         if hasattr(self, "weaviate_connection") and self.weaviate_connection is not None:
@@ -671,7 +691,7 @@ class SmartRouter:
             resp_gen = self.rag.options(stream=True).make_context_prediction.remote(req, request_id)
 
             async def passthrough_sse():
-                span = mlflow.start_span_no_context(name="chat_completions_stream", span_type="RETRIEVER")
+                span = mlflow.start_span_no_context(name="chat_completions_stream", span_type="CHAT_MODEL")
                 span.set_inputs(trace_inputs)
                 span.set_attributes({
                     "environment": "staging",
@@ -724,7 +744,7 @@ class SmartRouter:
                 },
             )
 
-        with mlflow.start_span(name="chat_completions", span_type="RETRIEVER") as span:
+        with mlflow.start_span(name="chat_completions", span_type="CHAT_MODEL") as span:
             span.set_inputs(trace_inputs)
             span.set_attributes({
                 "environment": "staging",
