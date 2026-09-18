@@ -40,19 +40,6 @@ def init_logger():
 
 logger = init_logger()
 
-DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
-DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
-
-LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
-
-
-def short(value: Any, limit: int = LOG_SNIPPET_LEN) -> str:
-    """Однострочный обрезанный снипсет для логов."""
-    text = str(value).replace("\n", "\\n")
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}...(+{len(text) - limit} chars)"
-
 PRODUCTS = [ "starguard" ]
 
 # PRODUCTS = [
@@ -69,6 +56,19 @@ PRODUCTS = [ "starguard" ]
 #     "knowledgebase", 
 #     "solutions",
 # ]
+
+DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
+DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
+
+LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
+
+
+def short(value: Any, limit: int = LOG_SNIPPET_LEN) -> str:
+    """Однострочный обрезанный снипсет для логов."""
+    text = str(value).replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...(+{len(text) - limit} chars)"
 
 RERANKER_MODEL_ID = os.getenv("RERANKER_MODEL_ID", "BAAI/bge-reranker-v2-m3")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "NewWikiDocs")
