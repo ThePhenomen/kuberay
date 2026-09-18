@@ -444,24 +444,24 @@ class Searcher:
                 return_metadata=MetadataQuery(score=True),
                 return_properties=return_properties,
             ),
-            asyncio.to_thread(
-                self.product_collections["knowledgebase"].query.hybrid,
-                query=query_text,
-                alpha=0.3,
-                limit=7,
-                filters=Filter.by_property("version").equal(version),
-                return_metadata=MetadataQuery(score=True),
-                return_properties=return_properties,
-            ),
-            asyncio.to_thread(
-                self.product_collections["solutions"].query.hybrid,
-                query=query_text,
-                alpha=0.3,
-                limit=7,
-                filters=Filter.by_property("version").equal(version),
-                return_metadata=MetadataQuery(score=True),
-                return_properties=return_properties,
-            ),
+            # asyncio.to_thread(
+            #     self.product_collections["knowledgebase"].query.hybrid,
+            #     query=query_text,
+            #     alpha=0.3,
+            #     limit=7,
+            #     filters=Filter.by_property("version").equal(version),
+            #     return_metadata=MetadataQuery(score=True),
+            #     return_properties=return_properties,
+            # ),
+            # asyncio.to_thread(
+            #     self.product_collections["solutions"].query.hybrid,
+            #     query=query_text,
+            #     alpha=0.3,
+            #     limit=7,
+            #     filters=Filter.by_property("version").equal(version),
+            #     return_metadata=MetadataQuery(score=True),
+            #     return_properties=return_properties,
+            # ),
         )
 
         self.logger.info(
