@@ -19,7 +19,7 @@ from vllm.sampling_params import SamplingParams
 import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, MetadataQuery
-ра
+
 import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
