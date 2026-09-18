@@ -434,46 +434,59 @@ class Searcher:
         return_properties = ["title", "page_content", "page_url", "source"]
 
         self.logger.info(f"[req: {request_id}] Execute remote document search in db {product_name}")
-        res_main = await asyncio.gather(
-        # res_main, res_knowledge_base, res_solutions = await asyncio.gather(
-            asyncio.to_thread(
-                collection.query.hybrid,
-                query=query_text,
-                alpha=0.3,
-                limit=15,
-                filters=Filter.by_property("version").equal(product_version),
-                return_metadata=MetadataQuery(score=True),
-                return_properties=return_properties,
+        # Список пар (имя, запрос): коллекцию можно закомментировать,
+        # не правя распаковку результатов и логирование.
+        pending = [
+            (
+                product_name,
+                asyncio.to_thread(
+                    collection.query.hybrid,
+                    query=query_text,
+                    alpha=0.3,
+                    limit=15,
+                    filters=Filter.by_property("version").equal(product_version),
+                    return_metadata=MetadataQuery(score=True),
+                    return_properties=return_properties,
+                ),
             ),
-            # asyncio.to_thread(
-            #     self.product_collections["knowledgebase"].query.hybrid,
-            #     query=query_text,
-            #     alpha=0.3,
-            #     limit=7,
-            #     filters=Filter.by_property("version").equal(version),
-            #     return_metadata=MetadataQuery(score=True),
-            #     return_properties=return_properties,
+            # (
+            #     "knowledgebase",
+            #     asyncio.to_thread(
+            #         self.product_collections["knowledgebase"].query.hybrid,
+            #         query=query_text,
+            #         alpha=0.3,
+            #         limit=7,
+            #         filters=Filter.by_property("version").equal(version),
+            #         return_metadata=MetadataQuery(score=True),
+            #         return_properties=return_properties,
+            #     ),
             # ),
-            # asyncio.to_thread(
-            #     self.product_collections["solutions"].query.hybrid,
-            #     query=query_text,
-            #     alpha=0.3,
-            #     limit=7,
-            #     filters=Filter.by_property("version").equal(version),
-            #     return_metadata=MetadataQuery(score=True),
-            #     return_properties=return_properties,
+            # (
+            #     "solutions",
+            #     asyncio.to_thread(
+            #         self.product_collections["solutions"].query.hybrid,
+            #         query=query_text,
+            #         alpha=0.3,
+            #         limit=7,
+            #         filters=Filter.by_property("version").equal(version),
+            #         return_metadata=MetadataQuery(score=True),
+            #         return_properties=return_properties,
+            #     ),
             # ),
-        )
+        ]
+
+        results = await asyncio.gather(*(task for _, task in pending))
 
         self.logger.info(
-            f"Found following docs: {product_name} - {len(res_main.objects)}, "
-            # f"knowledgebase - {len(res_knowledge_base.objects)}, "
-            # f"solutions - {len(res_solutions.objects)}"
+            f"[req: {request_id}] Found following docs: "
+            + ", ".join(
+                f"{name} - {len(res.objects or [])}"
+                for (name, _), res in zip(pending, results)
+            )
         )
 
         ranked_lists = []
-        # for res in (res_main, res_knowledge_base, res_solutions):
-        for res in (res_main):
+        for res in results:
             ranked_lists.append([
                 {
                     "title": obj.properties.get("title", ""),
@@ -482,7 +495,7 @@ class Searcher:
                     "source": obj.properties.get("source", ""),
                     "hybrid_score": obj.metadata.score or 0.0,
                 }
-                for obj in res.objects
+                for obj in (res.objects or [])
             ])
         return ranked_lists
 
