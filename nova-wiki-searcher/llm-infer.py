@@ -434,7 +434,8 @@ class Searcher:
         return_properties = ["title", "page_content", "page_url", "source"]
 
         self.logger.info(f"[req: {request_id}] Execute remote document search in db {product_name}")
-        res_main, res_knowledge_base, res_solutions = await asyncio.gather(
+        res_main = await asyncio.gather(
+        # res_main, res_knowledge_base, res_solutions = await asyncio.gather(
             asyncio.to_thread(
                 collection.query.hybrid,
                 query=query_text,
@@ -466,12 +467,13 @@ class Searcher:
 
         self.logger.info(
             f"Found following docs: {product_name} - {len(res_main.objects)}, "
-            f"knowledgebase - {len(res_knowledge_base.objects)}, "
-            f"solutions - {len(res_solutions.objects)}"
+            # f"knowledgebase - {len(res_knowledge_base.objects)}, "
+            # f"solutions - {len(res_solutions.objects)}"
         )
 
         ranked_lists = []
-        for res in (res_main, res_knowledge_base, res_solutions):
+        # for res in (res_main, res_knowledge_base, res_solutions):
+        for res in (res_main):
             ranked_lists.append([
                 {
                     "title": obj.properties.get("title", ""),
