@@ -9,7 +9,7 @@ import torch
 import re
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from ray import serve
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -19,7 +19,7 @@ from vllm.sampling_params import SamplingParams
 import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, MetadataQuery
-
+ра
 import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -29,10 +29,29 @@ logging.basicConfig(
 )
 
 def init_logger():
-    """Get the root logger"""
-    return logging.getLogger("rag_service")
+    """Get the service logger.
+
+    Уровень выставляется явно: в воркерах Ray Serve конфиг root-логгера
+    переопределяется, из-за чего LOG_LEVEL=DEBUG иначе не срабатывает.
+    """
+    service_logger = logging.getLogger("rag_service")
+    service_logger.setLevel(LOG_LEVEL)
+    return service_logger
 
 logger = init_logger()
+
+DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
+DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
+
+LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
+
+
+def short(value: Any, limit: int = LOG_SNIPPET_LEN) -> str:
+    """Однострочный обрезанный снипсет для логов."""
+    text = str(value).replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...(+{len(text) - limit} chars)"
 
 PRODUCTS = [ "starguard" ]
 
@@ -259,8 +278,8 @@ class ChatCompletionResponse(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    product_name: str = "nova"
-    product_version: str = "latest"
+    product_name: str = DEFAULT_PRODUCT
+    product_version: str = DEFAULT_PRODUCT_VERSION
     top_k: int = 5
 
 class SearchResultDocument(BaseModel):
@@ -332,11 +351,10 @@ class Reranker:
 
         start_time = time.perf_counter()
         self.logger.info(
-            f"[req: {request_id}] Rerank started, docs_count=%d, top_k=%d, alpha=%.2f",
-            len(docs),
-            top_k,
-            alpha,
+            f"[req: {request_id}] Rerank started: docs_count={len(docs)}, "
+            f"top_k={top_k}, alpha={alpha:.2f}"
         )
+        self.logger.debug(f"[req: {request_id}] Rerank query: {short(query)}")
 
         pairs = []
         for doc in docs:
@@ -347,9 +365,14 @@ class Reranker:
             snippet = f"{title}\n{content}"[:RERANK_MAX_CHARS]
             pairs.append([query, snippet])
 
+        score_start = time.perf_counter()
         rerank_scores = self._score_pairs(pairs)
-
-        self.logger.debug(f"[req: {request_id}] Raw rerank scores computed, calucalted scores: {rerank_scores}")
+        batches = math.ceil(len(pairs) / RERANK_BATCH_SIZE)
+        self.logger.debug(
+            f"[req: {request_id}] Scored {len(pairs)} pairs in {batches} batch(es) "
+            f"(batch_size={RERANK_BATCH_SIZE}, max_length={RERANK_MAX_LENGTH}) "
+            f"in {time.perf_counter() - score_start:.3f}s"
+        )
 
         # Приор от retrieval: RRF-ранг сопоставим между коллекциями, в отличие
         # от сырого hybrid_score, поэтому он предпочтительнее при наличии.
@@ -379,18 +402,22 @@ class Reranker:
             scored_docs.append(doc)
         scored_docs.sort(key=lambda d: d["combined_score"], reverse=True)
 
-        self.logger.debug(
-            f"[req: {request_id}] Top reranked docs (count=%d, top_k=%d)",
-            len(scored_docs),
-            top_k,
-        )
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for rank, doc in enumerate(scored_docs[:min(top_k, 5)], start=1):
+                self.logger.debug(
+                    f"[req: {request_id}] Reranked #{rank} "
+                    f"combined={doc['combined_score']:.4f} "
+                    f"rerank_raw={doc['rerank_score_raw']:.4f} "
+                    f"prior_raw={doc['prior_score_raw']:.5f} "
+                    f"url={doc.get('page_url', '')}"
+                )
 
         elapsed = time.perf_counter() - start_time
+        top_raw = scored_docs[0]["rerank_score_raw"] if scored_docs else 0.0
         self.logger.info(
-            f"[req: {request_id}] Rerank finished (docs=%d, returned=%d, elapsed=%.6f sec)",
-            len(docs),
-            min(len(scored_docs), top_k),
-            round(elapsed, 6),
+            f"[req: {request_id}] Rerank finished: docs={len(docs)}, "
+            f"returned={min(len(scored_docs), top_k)}, top_rerank_raw={top_raw:.4f}, "
+            f"elapsed={elapsed:.6f}s"
         )
 
         return scored_docs[:top_k]
@@ -422,18 +449,45 @@ class Searcher:
             raise RuntimeError("Weaviate is not ready, aborting Searcher initialization")
         
         self.product_collections = {}
+        aliases = {}
         for product in PRODUCTS:
             product_alias = f"{COLLECTION_NAME}{product.replace('-', '_').capitalize()}"
+            aliases[product] = product_alias
             self.product_collections[product] = self.weaviate_connection.collections.use(product_alias)
+
+        self.logger.info(
+            f"Weaviate ready at {WEAVIATE_HTTP_ADDR}:{WEAVIATE_HTTP_PORT}, "
+            f"default product '{DEFAULT_PRODUCT}', mapped {len(aliases)} collections"
+        )
+        for product, alias in aliases.items():
+            self.logger.info(f"  product '{product}' -> collection '{alias}'")
 
     async def _fetch_docs_parallel(self, query_text: str, product_name: str, product_version: str, request_id: str) -> List[List[Dict[str, Any]]]:
         """Возвращает ранжированные списки по коллекциям — отдельно, для RRF."""
-        collection = self.product_collections.get(product_name) or self.product_collections["nova"]
+        collection = self.product_collections.get(product_name)
+        if collection is None:
+            fallback = self.product_collections.get(DEFAULT_PRODUCT)
+            if fallback is None:
+                raise RuntimeError(
+                    f"[req: {request_id}] No collection for product '{product_name}', "
+                    f"and default product '{DEFAULT_PRODUCT}' is not in PRODUCTS={PRODUCTS}"
+                )
+            self.logger.warning(
+                f"[req: {request_id}] Unknown product '{product_name}', "
+                f"falling back to '{DEFAULT_PRODUCT}'"
+            )
+            collection = fallback
+            product_name = DEFAULT_PRODUCT
+
         version = "latest" if product_name == "zvirt" else product_name
 
         return_properties = ["title", "page_content", "page_url", "source"]
 
-        self.logger.info(f"[req: {request_id}] Execute remote document search in db {product_name}")
+        self.logger.info(
+            f"[req: {request_id}] Hybrid search in '{product_name}' "
+            f"(version={product_version}, alpha=0.3)"
+        )
+        self.logger.debug(f"[req: {request_id}] Query text: {short(query_text)}")
         # Список пар (имя, запрос): коллекцию можно закомментировать,
         # не правя распаковку результатов и логирование.
         pending = [
@@ -475,15 +529,26 @@ class Searcher:
             # ),
         ]
 
+        fetch_start = time.perf_counter()
         results = await asyncio.gather(*(task for _, task in pending))
+        fetch_elapsed = time.perf_counter() - fetch_start
 
         self.logger.info(
-            f"[req: {request_id}] Found following docs: "
+            f"[req: {request_id}] Found following docs in {fetch_elapsed:.3f}s: "
             + ", ".join(
                 f"{name} - {len(res.objects or [])}"
                 for (name, _), res in zip(pending, results)
             )
         )
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for (name, _), res in zip(pending, results):
+                for rank, obj in enumerate((res.objects or [])[:5], start=1):
+                    self.logger.debug(
+                        f"[req: {request_id}] {name} #{rank} "
+                        f"score={obj.metadata.score or 0.0:.4f} "
+                        f"src={obj.properties.get('source', '')}"
+                    )
 
         ranked_lists = []
         for res in results:
@@ -582,26 +647,76 @@ class Searcher:
         alpha: float = 0.8
     ) -> List[Dict[str, Any]]:
         docs_start_time = time.perf_counter()
+        self.logger.info(
+            f"[req: {request_id}] Search started: product={product_name}, "
+            f"version={product_version}, queries={len(queries)}, top_k={top_k}, alpha={alpha}"
+        )
+        for idx, q in enumerate(queries):
+            self.logger.debug(f"[req: {request_id}] Query #{idx}: {short(q)}")
 
         tasks = [self._fetch_docs_parallel(q, product_name, product_version, request_id) for q in queries]
         per_query_lists = await asyncio.gather(*tasks)
 
         ranked_lists = [ranked for lists in per_query_lists for ranked in lists]
-        raw_docs = self._fuse_rrf(ranked_lists)[:SEARCH_CANDIDATES_LIMIT]
+        fused = self._fuse_rrf(ranked_lists)
+        raw_docs = fused[:SEARCH_CANDIDATES_LIMIT]
 
         docs_end_time = time.perf_counter()
-        self.logger.info(f"[req: {request_id}] Retrieved {len(raw_docs)} unique documents in {docs_end_time - docs_start_time:.6f}s")
+        self.logger.info(
+            f"[req: {request_id}] Retrieved {len(raw_docs)} unique documents "
+            f"(fused {len(fused)} from {len(ranked_lists)} ranked lists) "
+            f"in {docs_end_time - docs_start_time:.6f}s"
+        )
 
         if not raw_docs:
+            self.logger.warning(
+                f"[req: {request_id}] No documents found for product={product_name}, "
+                f"version={product_version}"
+            )
             return []
 
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for rank, doc in enumerate(raw_docs[:5], start=1):
+                self.logger.debug(
+                    f"[req: {request_id}] RRF #{rank} rrf={doc.get('rrf_score', 0.0):.5f} "
+                    f"hybrid={doc.get('hybrid_score', 0.0):.4f} src={doc.get('source', '')}"
+                )
+
         main_query = queries[0]
+        rerank_start = time.perf_counter()
         scored_docs = await self.reranker.rerank.remote(
             main_query, request_id, raw_docs, top_k=len(raw_docs), alpha=alpha
         )
+        self.logger.info(
+            f"[req: {request_id}] Reranked {len(scored_docs)} documents "
+            f"in {time.perf_counter() - rerank_start:.3f}s"
+        )
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for rank, doc in enumerate(scored_docs[:5], start=1):
+                self.logger.debug(
+                    f"[req: {request_id}] Rerank #{rank} "
+                    f"raw={doc.get('rerank_score_raw', 0.0):.4f} "
+                    f"combined={doc.get('combined_score', 0.0):.4f} "
+                    f"src={doc.get('source', '')}"
+                )
 
         selected = self._select_diverse(scored_docs, top_k)
-        return self._merge_adjacent_chunks(selected)
+        merged = self._merge_adjacent_chunks(selected)
+
+        self.logger.info(
+            f"[req: {request_id}] Search finished: {len(merged)} docs returned "
+            f"(selected {len(selected)} of {len(scored_docs)}, "
+            f"per_page_cap={SEARCH_PER_PAGE_CAP}) "
+            f"in {time.perf_counter() - docs_start_time:.3f}s"
+        )
+        for rank, doc in enumerate(merged, start=1):
+            self.logger.info(
+                f"[req: {request_id}] Doc #{rank} "
+                f"score={doc.get('combined_score', 0.0):.4f} url={doc.get('page_url', '')}"
+            )
+
+        return merged
 
     def close(self):
         if hasattr(self, "weaviate_connection") and self.weaviate_connection is not None:
@@ -637,8 +752,15 @@ class RAGSystem:
             "enforce_eager": False,
         }
 
+        self.logger.info(f"vLLM engine args: {engine_kwargs}")
         self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_kwargs))
         self.tokenizer = AutoTokenizer.from_pretrained(RAG_LLM_MODEL, trust_remote_code=True)
+        self.logger.info(
+            f"RAGSystem ready: model={RAG_LLM_MODEL}, "
+            f"answer_thinking={RAG_LLM_ANSWER_THINKING}, "
+            f"answer_max_tokens={RAG_ANSWER_MAX_TOKENS}, "
+            f"hyde_threshold={HYDE_RERANK_THRESHOLD}"
+        )
 
     def _render_prompt(self, messages: List[Dict[str, str]], thinking: bool) -> str:
         try:
@@ -669,13 +791,31 @@ class RAGSystem:
         temperature: float = 0.3,
         top_p: float = 0.95,
         thinking: bool = False,
+        stage: str = "llm",
+        request_id: str = "-",
     ) -> str:
         prompt = self._render_prompt(messages, thinking)
         sampling_params = SamplingParams(
             temperature=temperature, top_p=top_p, max_tokens=max_tokens
         )
+
+        self.logger.info(
+            f"[req: {request_id}] LLM call '{stage}': prompt_chars={len(prompt)}, "
+            f"max_tokens={max_tokens}, temperature={temperature}, thinking={thinking}"
+        )
+        self.logger.debug(f"[req: {request_id}] '{stage}' prompt: {short(prompt)}")
+
+        start = time.perf_counter()
         text = await self._generate_text(prompt, sampling_params)
-        return self._strip_thinking(text)
+        elapsed = time.perf_counter() - start
+
+        result = self._strip_thinking(text)
+        self.logger.info(
+            f"[req: {request_id}] LLM call '{stage}' done in {elapsed:.3f}s: "
+            f"raw_chars={len(text)}, visible_chars={len(result)}"
+        )
+        self.logger.debug(f"[req: {request_id}] '{stage}' output: {short(result)}")
+        return result
 
     @staticmethod
     def _visible_text(text: str) -> str:
@@ -687,7 +827,12 @@ class RAGSystem:
             return ""
         return text[end + len("</think>"):].lstrip()
 
-    async def _stream_sse(self, messages: List[Dict[str, str]], max_tokens: int):
+    async def _stream_sse(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        parent_request_id: str = "-",
+    ):
         """Отдаёт ответ движка чанками в формате OpenAI chat.completion.chunk."""
         prompt = self._render_prompt(messages, RAG_LLM_ANSWER_THINKING)
         sampling_params = SamplingParams(
@@ -696,6 +841,13 @@ class RAGSystem:
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         request_id = str(uuid.uuid4())
+
+        self.logger.info(
+            f"[req: {parent_request_id}] Streaming answer started: "
+            f"prompt_chars={len(prompt)}, max_tokens={max_tokens}, "
+            f"thinking={RAG_LLM_ANSWER_THINKING}, engine_req={request_id}"
+        )
+        self.logger.debug(f"[req: {parent_request_id}] Stream prompt: {short(prompt)}")
 
         def sse(delta: Optional[str] = None, finish_reason: Optional[str] = None,
                 role: Optional[str] = None) -> bytes:
@@ -716,7 +868,10 @@ class RAGSystem:
         async def generator() -> AsyncGenerator[bytes, None]:
             yield sse(role="assistant")
             sent = 0
+            chunks = 0
             finish_reason = "stop"
+            stream_start = time.perf_counter()
+            first_token_at: Optional[float] = None
             try:
                 async for request_output in self.engine.generate(
                     prompt, sampling_params, request_id
@@ -724,32 +879,65 @@ class RAGSystem:
                     output = request_output.outputs[0]
                     visible = self._visible_text(output.text)
                     if len(visible) > sent:
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter() - stream_start
+                            self.logger.info(
+                                f"[req: {parent_request_id}] First visible token "
+                                f"in {first_token_at:.3f}s"
+                            )
                         yield sse(delta=visible[sent:])
                         sent = len(visible)
+                        chunks += 1
                     if output.finish_reason:
                         finish_reason = output.finish_reason
             except asyncio.CancelledError:
+                self.logger.warning(
+                    f"[req: {parent_request_id}] Stream cancelled after "
+                    f"{chunks} chunks / {sent} chars, aborting engine request"
+                )
                 await self.engine.abort(request_id)
                 raise
             except Exception as e:
-                self.logger.exception("Streaming generation failed")
+                self.logger.exception(
+                    f"[req: {parent_request_id}] Streaming generation failed: {e}"
+                )
                 yield f'data: {{"error": {{"message": "LLM error: {e}"}}}}\n\n'.encode("utf-8")
                 yield b"data: [DONE]\n\n"
                 return
+
+            self.logger.info(
+                f"[req: {parent_request_id}] Streaming answer finished: "
+                f"chunks={chunks}, chars={sent}, finish_reason={finish_reason}, "
+                f"ttft={first_token_at if first_token_at is not None else -1:.3f}s, "
+                f"total={time.perf_counter() - stream_start:.3f}s"
+            )
 
             yield sse(finish_reason=finish_reason)
             yield b"data: [DONE]\n\n"
 
         return generator()
 
-    async def _generate_answer(self, messages: List[Dict[str, str]], max_tokens: int, stream: bool = False):
+    async def _generate_answer(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        stream: bool = False,
+        request_id: str = "-",
+    ):
         if stream:
-            return await self._stream_sse(messages=messages, max_tokens=max_tokens)
+            return await self._stream_sse(
+                messages=messages, max_tokens=max_tokens, parent_request_id=request_id
+            )
         return await self._chat(
-            messages, max_tokens=max_tokens, thinking=RAG_LLM_ANSWER_THINKING
+            messages,
+            max_tokens=max_tokens,
+            thinking=RAG_LLM_ANSWER_THINKING,
+            stage="answer",
+            request_id=request_id,
         )
 
     async def make_prediction(self, req: InputQuestion, request_id: str) -> OutputAnswer:
+        start_time = time.perf_counter()
         messages = [DEFAULT_SYSTEM_PROMPT_MESSAGES[0]]
         for m in req.query:
             role = m.get("role", "")
@@ -757,13 +945,23 @@ class RAGSystem:
             if content and role in ("user", "assistant"):
                 messages.append({"role": role, "content": self._strip_thinking(content)})
 
-        self.logger.info(f"[req: {request_id}] Generating remote answer...")
+        self.logger.info(
+            f"[req: {request_id}] Plain (no-RAG) generation: "
+            f"messages={len(messages)}, max_tokens={SIMPLE_ANSWER_MAX_TOKENS}"
+        )
         answer_text = await self._chat(
             messages,
             max_tokens=SIMPLE_ANSWER_MAX_TOKENS,
             thinking=RAG_LLM_ANSWER_THINKING,
+            stage="plain-answer",
+            request_id=request_id,
         )
-        return OutputAnswer(answer=self._strip_thinking(answer_text))
+        answer = self._strip_thinking(answer_text)
+        self.logger.info(
+            f"[req: {request_id}] Plain generation done in "
+            f"{time.perf_counter() - start_time:.3f}s, chars={len(answer)}"
+        )
+        return OutputAnswer(answer=answer)
     
     async def _compress_history(self, messages: List[Dict[str, Any]], request_id: str) -> str:
 
@@ -773,10 +971,15 @@ class RAGSystem:
 
         history = messages[-7:-1]
         if not history:
+            self.logger.info(f"[req: {request_id}] Rewrite skipped: no history")
             return last_user_msg
 
         last_words = last_user_msg.split()
         if len(last_words) > 20:
+            self.logger.info(
+                f"[req: {request_id}] Rewrite skipped: question is self-contained "
+                f"({len(last_words)} words > 20)"
+            )
             return last_user_msg
 
         history_lines = []
@@ -797,9 +1000,14 @@ class RAGSystem:
                     history_lines.append(f"Assistant: {snippet}")
 
         if not history_lines:
+            self.logger.info(f"[req: {request_id}] Rewrite skipped: history is empty after cleanup")
             return last_user_msg
-        
-        self.logger.debug(f"[req: {request_id}] History: {history_lines}")
+
+        self.logger.info(
+            f"[req: {request_id}] Rewriting query with {len(history_lines)} history lines"
+        )
+        for line in history_lines:
+            self.logger.debug(f"[req: {request_id}] History: {short(line)}")
 
         history_text = "\n".join(history_lines)
 
@@ -817,6 +1025,8 @@ class RAGSystem:
                 temperature=0.0,
                 top_p=1.0,
                 thinking=False,
+                stage="rewrite",
+                request_id=request_id,
             )
         except Exception as e:
             self.logger.warning(f"[req: {request_id}] Query rewrite failed: {e}")
@@ -824,10 +1034,13 @@ class RAGSystem:
 
         # модель может вернуть <think> даже при выключенных рассуждениях
         result = self._strip_thinking(rewritten).strip().strip('"')
-        self.logger.debug(f"[req: {request_id}] Query rewrite: [{last_user_msg}] → [{result}]")
+        self.logger.info(
+            f"[req: {request_id}] Query rewritten: [{short(last_user_msg, 120)}] -> "
+            f"[{short(result, 120)}]"
+        )
         return result or last_user_msg
     
-    async def _generate_hyde(self, search_query: str) -> str:
+    async def _generate_hyde(self, search_query: str, request_id: str = "-") -> str:
         filled_hyde_messages = [
             {
                 "role": m["role"],
@@ -842,14 +1055,25 @@ class RAGSystem:
                 temperature=0.0,
                 top_p=1.0,
                 thinking=False,
+                stage="hyde",
+                request_id=request_id,
             )
         except asyncio.CancelledError:
+            self.logger.debug(f"[req: {request_id}] HyDE task cancelled")
             raise
         except Exception as e:
-            self.logger.warning(f"HyDE generation failed: {e}")
+            self.logger.warning(f"[req: {request_id}] HyDE generation failed: {e}")
             return search_query
 
-        return self._strip_thinking(h_doc) or search_query
+        result = self._strip_thinking(h_doc)
+        if not result:
+            self.logger.warning(
+                f"[req: {request_id}] HyDE returned empty text, falling back to query"
+            )
+            return search_query
+
+        self.logger.debug(f"[req: {request_id}] HyDE doc: {short(result)}")
+        return result
 
     def _strip_thinking(self, text: str) -> str:
         return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -900,22 +1124,37 @@ class RAGSystem:
     async def make_context_prediction(self, req: InputRagQuestion, request_id: str):
         last_user_msg = next((m["content"] for m in reversed(req.query) if m.get("role") == "user"), "")
 
-        self.logger.debug(f"[req: {request_id}] Input request: {req.query}")
-        self.logger.debug(f"[req: {request_id}] Last user message: {last_user_msg}")
-        
+        self.logger.info(
+            f"[req: {request_id}] RAG request: product={req.product_name}, "
+            f"version={req.product_version}, stream={req.stream}, "
+            f"messages={len(req.query)}, last_user_chars={len(last_user_msg)}"
+        )
+        self.logger.debug(f"[req: {request_id}] Input request: {short(req.query, 1000)}")
+        self.logger.debug(f"[req: {request_id}] Last user message: {short(last_user_msg)}")
+
         start_time = time.perf_counter()
 
         search_query = await self._compress_history(req.query, request_id)
+        rewrite_done = time.perf_counter()
+        self.logger.info(
+            f"[req: {request_id}] Search query ready in {rewrite_done - start_time:.3f}s: "
+            f"{short(search_query, 200)}"
+        )
 
         # HyDE считается параллельно с первым поиском, поэтому его латентность
         # скрывается за retrieval. Второй проход делаем только если top-1 слабый.
-        hyde_task = asyncio.create_task(self._generate_hyde(search_query))
+        hyde_task = asyncio.create_task(self._generate_hyde(search_query, request_id))
         reranked_docs = await self.searcher.search.remote(
             queries=[search_query],
             product_name=req.product_name,
             product_version=req.product_version,
             top_k=5,
             request_id=request_id,
+        )
+        retrieval_done = time.perf_counter()
+        self.logger.info(
+            f"[req: {request_id}] First retrieval pass: {len(reranked_docs)} docs "
+            f"in {retrieval_done - rewrite_done:.3f}s"
         )
 
         top_score = max(
@@ -924,10 +1163,10 @@ class RAGSystem:
         )
 
         if top_score < HYDE_RERANK_THRESHOLD:
-            h_doc = await hyde_task
             self.logger.info(
                 f"[req: {request_id}] Weak top-1 ({top_score:.3f} < {HYDE_RERANK_THRESHOLD}), retrying with HyDE"
             )
+            h_doc = await hyde_task
             reranked_docs = await self.searcher.search.remote(
                 queries=[search_query, h_doc],
                 product_name=req.product_name,
@@ -935,13 +1174,21 @@ class RAGSystem:
                 top_k=5,
                 request_id=request_id,
             )
+            self.logger.info(
+                f"[req: {request_id}] HyDE retrieval pass: {len(reranked_docs)} docs "
+                f"in {time.perf_counter() - retrieval_done:.3f}s"
+            )
         else:
             hyde_task.cancel()
-            self.logger.debug(
-                f"[req: {request_id}] HyDE skipped, top-1 rerank score {top_score:.3f}"
+            self.logger.info(
+                f"[req: {request_id}] HyDE skipped, top-1 rerank score {top_score:.3f} "
+                f">= {HYDE_RERANK_THRESHOLD}"
             )
 
         if not reranked_docs:
+            self.logger.warning(
+                f"[req: {request_id}] No relevant docs after retrieval, returning stub answer"
+            )
             if req.stream:
                 async def empty_stream():
                     yield b'data: {"choices":[{"delta":{"content":"Failed to find relevant docs."}}]}\n\n'
@@ -953,20 +1200,36 @@ class RAGSystem:
         context = "\n\n---\n\n".join(texts_with_links)
 
         rag_messages = self._build_rag_messages_hybrid(req.query, context)
-        self.logger.debug(f"[req: {request_id}] Raw messages: {rag_messages}")
+
+        self.logger.info(
+            f"[req: {request_id}] Context built from {len(reranked_docs)} docs: "
+            f"{len(context)} chars (~{len(context) // 4} tokens), "
+            f"sources: {', '.join(doc.get('page_url', '') for doc in reranked_docs)}"
+        )
+        self.logger.debug(f"[req: {request_id}] Context: {short(context, 2000)}")
+        self.logger.debug(f"[req: {request_id}] Raw messages: {short(rag_messages, 2000)}")
 
         end_time = time.perf_counter()
         self.logger.info(f"[req: {request_id}] Init actions for request {request_id} done in {end_time - start_time:.6f}s")
 
-        self.logger.info(f"[req: {request_id}] Generating remote answer...")
         if not req.stream:
             final_answer = await self._generate_answer(
-                rag_messages, max_tokens=RAG_ANSWER_MAX_TOKENS, stream=False
+                rag_messages,
+                max_tokens=RAG_ANSWER_MAX_TOKENS,
+                stream=False,
+                request_id=request_id,
+            )
+            self.logger.info(
+                f"[req: {request_id}] RAG request completed in "
+                f"{time.perf_counter() - start_time:.3f}s, answer_chars={len(final_answer)}"
             )
             return OutputAnswer(answer=final_answer)
 
         return await self._generate_answer(
-            rag_messages, max_tokens=RAG_ANSWER_MAX_TOKENS, stream=True
+            rag_messages,
+            max_tokens=RAG_ANSWER_MAX_TOKENS,
+            stream=True,
+            request_id=request_id,
         )
     
 @serve.deployment(
@@ -978,6 +1241,11 @@ class SmartRouter:
     def __init__(self, rag_handle, searcher_handle):
         self.rag = rag_handle
         self.searcher = searcher_handle
+        self.logger = init_logger()
+        self.logger.info(
+            f"SmartRouter ready: default product='{DEFAULT_PRODUCT}', "
+            f"version='{DEFAULT_PRODUCT_VERSION}', known products={PRODUCTS}"
+        )
 
     @app.get("/v1/models")
     async def list_models(self):
@@ -988,16 +1256,78 @@ class SmartRouter:
     
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: Request):
-        body: Dict[str, Any] = await request.json()
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created_time = int(time.time())
+        router_start = time.perf_counter()
+
+        raw_body = await request.body()
+        try:
+            body: Dict[str, Any] = json.loads(raw_body)
+        except json.JSONDecodeError as e:
+            # Чаще всего клиент присылает сырые переводы строк внутри JSON-строки
+            self.logger.warning(
+                f"[req: {request_id}] Malformed JSON body ({len(raw_body)} bytes) "
+                f"at line {e.lineno} col {e.colno}: {e.msg}"
+            )
+            self.logger.debug(
+                f"[req: {request_id}] Raw body: "
+                f"{short(raw_body.decode('utf-8', errors='replace'), 1000)}"
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": (
+                            f"Invalid JSON in request body: {e.msg} "
+                            f"(line {e.lineno}, column {e.colno}). "
+                            "Escape newlines inside string values as \\n."
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "invalid_json",
+                    }
+                },
+            )
+
+        if not isinstance(body, dict):
+            self.logger.warning(
+                f"[req: {request_id}] Request body must be a JSON object, got {type(body).__name__}"
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Request body must be a JSON object, got {type(body).__name__}",
+                        "type": "invalid_request_error",
+                        "code": "invalid_json",
+                    }
+                },
+            )
+
         model = body.get("model", "wiki-searcher")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
-        product_name = str(body.get("product_name", "nova"))
-        product_version = str(body.get("product_version", "latest"))
+        product_name = str(body.get("product_name") or DEFAULT_PRODUCT)
+        product_version = str(body.get("product_version") or DEFAULT_PRODUCT_VERSION)
         user_request = body.get("user_request", False)
 
-        request_id = f"chatcmpl-{uuid.uuid4().hex}"
-        created_time = int(time.time())
+        self.logger.info(
+            f"[req: {request_id}] POST /v1/chat/completions: model={model}, "
+            f"product={product_name}, version={product_version}, stream={stream}, "
+            f"user_request={user_request}, messages={len(messages)}"
+        )
+        self.logger.debug(
+            f"[req: {request_id}] Unknown body keys: "
+            f"{sorted(set(body) - {'model', 'messages', 'stream', 'product_name', 'product_version', 'user_request'})}"
+        )
+
+        if product_name not in PRODUCTS:
+            self.logger.warning(
+                f"[req: {request_id}] Product '{product_name}' is not in PRODUCTS={PRODUCTS}, "
+                f"search will fall back to '{DEFAULT_PRODUCT}'"
+            )
+
+        if not messages:
+            self.logger.warning(f"[req: {request_id}] Empty 'messages' in request body")
 
         if stream and user_request:
             req = InputRagQuestion(
@@ -1009,10 +1339,20 @@ class SmartRouter:
             resp_gen = self.rag.options(stream=True).make_context_prediction.remote(req, request_id)
 
             async def passthrough_sse():
+                forwarded = 0
                 async for chunk in resp_gen:
                     if await request.is_disconnected():
+                        self.logger.warning(
+                            f"[req: {request_id}] Client disconnected after "
+                            f"{forwarded} chunks, stopping stream"
+                        )
                         break
+                    forwarded += 1
                     yield chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+                self.logger.info(
+                    f"[req: {request_id}] Stream closed: {forwarded} chunks forwarded "
+                    f"in {time.perf_counter() - router_start:.3f}s"
+                )
 
             return StreamingResponse(
                 passthrough_sse(),
@@ -1036,6 +1376,11 @@ class SmartRouter:
             req = InputQuestion(query=messages, stream=False)
             resp = await self.rag.make_prediction.remote(req, request_id)
 
+        self.logger.info(
+            f"[req: {request_id}] Response ready in {time.perf_counter() - router_start:.3f}s, "
+            f"answer_chars={len(resp.answer)}"
+        )
+
         return ChatCompletionResponse(
             id=request_id,
             object="chat.completion",
@@ -1053,6 +1398,13 @@ class SmartRouter:
     @app.post("/search", response_model=SearchResponse)
     async def search_endpoint(self, req: SearchRequest):
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        search_start = time.perf_counter()
+        self.logger.info(
+            f"[req: {request_id}] POST /search: product={req.product_name}, "
+            f"version={req.product_version}, top_k={req.top_k}"
+        )
+        self.logger.debug(f"[req: {request_id}] Search query: {short(req.query)}")
+
         docs = await self.searcher.search.remote(
             queries=[req.query],
             product_name=req.product_name,
@@ -1060,7 +1412,11 @@ class SmartRouter:
             top_k=req.top_k,
             request_id=request_id,
         )
-        
+        self.logger.info(
+            f"[req: {request_id}] /search returned {len(docs)} docs "
+            f"in {time.perf_counter() - search_start:.3f}s"
+        )
+
         results = []
         for doc in docs:
             results.append(SearchResultDocument(
