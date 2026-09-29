@@ -40,7 +40,7 @@ def init_logger():
 
 logger = init_logger()
 
-PRODUCTS = [ "starguard" ]
+PRODUCTS = [ "starguard", "kb" ]
 
 DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
 DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
