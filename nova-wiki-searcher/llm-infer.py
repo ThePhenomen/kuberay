@@ -950,7 +950,22 @@ class Searcher:
         scored_docs = await self.reranker.rerank.remote(
             query, request_id, raw_docs, top_k=len(raw_docs), alpha=0.8
         )
-        selected = self._select_diverse(scored_docs, top_k)
+        # Для каталожного поиска одна страница — один результат: чанк с лучшим score.
+        # RAG по-прежнему может взять несколько чанков через _select_diverse.
+        selected = []
+        seen_pages = set()
+        for doc in scored_docs:
+            page = (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
+            if not page or page in seen_pages:
+                continue
+            seen_pages.add(page)
+            selected.append(doc)
+            if len(selected) >= top_k:
+                break
+        self.logger.info(
+            f"[req: {request_id}] Collapsed {len(scored_docs)} chunks "
+            f"to {len(selected)} pages"
+        )
 
         documents = []
         for doc in selected:
@@ -971,9 +986,10 @@ class Searcher:
             f"[req: {request_id}] Catalog search finished: {len(documents)} docs "
             f"in {time.perf_counter() - docs_start_time:.3f}s"
         )
-        for rank, doc in enumerate(documents, start=1):
+        for rank, (doc, scored) in enumerate(zip(documents, selected), start=1):
             self.logger.info(
                 f"[req: {request_id}] Hit #{rank} "
+                f"score={scored.get('combined_score', 0.0):.4f} "
                 f"product={doc['product_name']} version={doc['version']} "
                 f"section={doc['section']} url={doc['page_url']}"
             )
