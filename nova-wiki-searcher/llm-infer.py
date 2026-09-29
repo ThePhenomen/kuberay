@@ -42,6 +42,143 @@ logger = init_logger()
 
 PRODUCTS = [ "starguard" ]
 
+DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
+DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
+
+LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
+
+
+def short(value: Any, limit: int = LOG_SNIPPET_LEN) -> str:
+    """Однострочный обрезанный снипсет для логов."""
+    text = str(value).replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...(+{len(text) - limit} chars)"
+
+
+def _as_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    cleaned = []
+    for item in value:
+        text = str(item).strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
+def _clean_filter_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
+def catalog_filter(
+    product_name: Optional[str] = None,
+    version: Optional[str] = None,
+    section: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    categories: Optional[List[str]] = None,
+):
+    """Weaviate-фильтр только из переданных полей. None — ограничения нет."""
+    clauses = []
+    if product_name:
+        # В индексе лежат и slug (product), и имя из article:product.
+        clauses.append(Filter.any_of([
+            Filter.by_property("product_name").equal(product_name),
+            Filter.by_property("product").equal(product_name),
+        ]))
+    if version:
+        clauses.append(Filter.by_property("version").equal(version))
+    if section:
+        clauses.append(Filter.by_property("section").equal(section))
+    if tags:
+        clauses.append(Filter.by_property("tags").contains_all(tags))
+    if categories:
+        clauses.append(Filter.by_property("categories").contains_all(categories))
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return Filter.all_of(clauses)
+
+
+def snippet_around_query(text: str, query: str, radius: int = 60) -> str:
+    """Фрагмент текста: radius символов по обе стороны от найденных слов запроса.
+
+    Если слова далеко друг от друга, берётся самое плотное скопление.
+    Если буквального совпадения нет, возвращается начало текста той же длины.
+    """
+    if not text:
+        return ""
+    radius = max(0, radius)
+    words = [
+        word for word in re.findall(r"\w+", query, flags=re.UNICODE) if len(word) >= 2
+    ]
+    spans: List[tuple] = []
+    for word in words:
+        pattern = re.compile(
+            rf"(?<!\w){re.escape(word)}(?!\w)",
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+        spans.extend((match.start(), match.end()) for match in pattern.finditer(text))
+
+    window = radius * 2
+    if not spans:
+        end = min(len(text), window or len(text))
+        snippet = text[:end].strip()
+        return snippet + ("…" if end < len(text) else "")
+
+    spans.sort()
+    groups: List[List[tuple]] = [[spans[0]]]
+    for span in spans[1:]:
+        if span[0] - groups[-1][-1][1] <= window:
+            groups[-1].append(span)
+        else:
+            groups.append([span])
+    group = max(groups, key=lambda item: (len(item), -item[0][0]))
+
+    if window and group[-1][1] - group[0][0] > window:
+        best_start = group[0][0]
+        best_count = 1
+        for index, span in enumerate(group):
+            count = 0
+            for other in group[index:]:
+                if other[1] - span[0] > window:
+                    break
+                count += 1
+            if count > best_count:
+                best_count = count
+                best_start = span[0]
+        left = best_start
+        right = best_start
+        for span in group:
+            if span[0] >= left and span[1] <= left + window:
+                right = span[1]
+    else:
+        left, right = group[0][0], group[-1][1]
+
+    start = max(0, left - radius)
+    end = min(len(text), right + radius)
+    if start > 0:
+        space = text.rfind(" ", max(0, start - 15), start + 1)
+        if space != -1:
+            start = space + 1
+    if end < len(text):
+        space = text.find(" ", end, min(len(text), end + 15))
+        if space != -1:
+            end = space
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
 # PRODUCTS = [
 #     "nova",
 #     "zvirt",
@@ -57,19 +194,6 @@ PRODUCTS = [ "starguard" ]
 #     "solutions",
 # ]
 
-DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
-DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
-
-LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
-
-
-def short(value: Any, limit: int = LOG_SNIPPET_LEN) -> str:
-    """Однострочный обрезанный снипсет для логов."""
-    text = str(value).replace("\n", "\\n")
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}...(+{len(text) - limit} chars)"
-
 RERANKER_MODEL_ID = os.getenv("RERANKER_MODEL_ID", "BAAI/bge-reranker-v2-m3")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "NewWikiDocs")
 WEAVIATE_GRPC_ADDR = os.getenv("WEAVIATE_GRPC_ADDR", "weaviate-grpc.nova-weaviate.svc")
@@ -77,7 +201,6 @@ WEAVIATE_GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
 WEAVIATE_HTTP_ADDR = os.getenv("WEAVIATE_HTTP_ADDR", "weaviate.nova-weaviate.svc")
 WEAVIATE_HTTP_PORT = int(os.getenv("WEAVIATE_HTTP_PORT", "80"))
 WEAVIATE_API_TOKEN = os.getenv("WEAVIATE_API_TOKEN")
-
 
 RAG_LLM_MODEL = os.getenv("RAG_LLM_MODEL", "Qwen/Qwen3.6-35B-A3B-FP8")
 LLM_NUM_GPUS = float(os.getenv("LLM_NUM_GPUS", "0.9"))
@@ -89,8 +212,6 @@ LLM_MAX_NUM_BATCHED_TOKENS = int(os.getenv("LLM_MAX_NUM_BATCHED_TOKENS", "8192")
 LLM_GPU_MEMORY_UTILIZATION = float(os.getenv("LLM_GPU_MEMORY_UTILIZATION", "0.95"))
 LLM_KV_CACHE_DTYPE = os.getenv("LLM_KV_CACHE_DTYPE", "auto")
 
-# Для rewrite и HyDE рассуждения выключены всегда: там нужен короткий литерал.
-# Для финального ответа режим управляется флагом.
 RAG_LLM_ANSWER_THINKING = os.getenv("RAG_LLM_ANSWER_THINKING", "false").lower() in ("1", "true", "yes")
 
 RAG_ANSWER_MAX_TOKENS = int(os.getenv("RAG_ANSWER_MAX_TOKENS", "4096"))
@@ -98,20 +219,14 @@ SIMPLE_ANSWER_MAX_TOKENS = int(os.getenv("SIMPLE_ANSWER_MAX_TOKENS", "512"))
 REWRITE_MAX_TOKENS = int(os.getenv("REWRITE_MAX_TOKENS", "64"))
 HYDE_MAX_TOKENS = int(os.getenv("HYDE_MAX_TOKENS", "96"))
 
-# Реранкер: длину контролирует токенизатор, батчи держим небольшими,
-# чтобы не ловить пики памяти на GPU, который делится с vLLM.
 RERANK_MAX_LENGTH = int(os.getenv("RERANK_MAX_LENGTH", "2048"))
 RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "6000"))
 RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "16"))
 
-# Retrieval: RRF-слияние списков, ограничение кандидатов на реранк,
-# лимит чанков с одной страницы в финальном контексте.
 RRF_K = int(os.getenv("RRF_K", "60"))
 SEARCH_CANDIDATES_LIMIT = int(os.getenv("SEARCH_CANDIDATES_LIMIT", "40"))
 SEARCH_PER_PAGE_CAP = int(os.getenv("SEARCH_PER_PAGE_CAP", "2"))
 
-# HyDE вызывается адаптивно: только если первый проход дал слабый top-1.
-# Порог сравнивается с сырым логитом реранкера (для bge-reranker >0 ≈ релевантно).
 HYDE_RERANK_THRESHOLD = float(os.getenv("HYDE_RERANK_THRESHOLD", "0.0"))
 
 RAG_SYSTEM_PROMPT_MESSAGES = [
@@ -278,16 +393,25 @@ class ChatCompletionResponse(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    product_name: str = DEFAULT_PRODUCT
-    product_version: str = DEFAULT_PRODUCT_VERSION
     top_k: int = 5
+    # символов контекста по обе стороны от найденных слов
+    context_chars: int = 60
+    # Пустое значение не фильтрует. tags и categories — документ должен содержать все указанные.
+    product_name: Optional[str] = None
+    version: Optional[str] = None
+    section: Optional[str] = None
+    tags: Optional[str | List[str]] = None
+    categories: Optional[str | List[str]] = None
 
 class SearchResultDocument(BaseModel):
-    url: str
-    score: float
+    title: str
+    categories: List[str]
+    tags: List[str]
+    section: str
     content: str
+    page_url: str
     product_name: str
-    product_version: str
+    version: str
 
 class SearchResponse(BaseModel):
     results: List[SearchResultDocument]
@@ -360,8 +484,6 @@ class Reranker:
         for doc in docs:
             title = doc.get("title", "")
             content = doc.get("page_content", "")
-            # длину режет токенизатор по RERANK_MAX_LENGTH; тут только страховка
-            # от аномально больших страниц, чтобы не тормозить токенизацию
             snippet = f"{title}\n{content}"[:RERANK_MAX_CHARS]
             pairs.append([query, snippet])
 
@@ -374,8 +496,6 @@ class Reranker:
             f"in {time.perf_counter() - score_start:.3f}s"
         )
 
-        # Приор от retrieval: RRF-ранг сопоставим между коллекциями, в отличие
-        # от сырого hybrid_score, поэтому он предпочтительнее при наличии.
         prior_scores = [
             float(doc.get("rrf_score", doc.get("hybrid_score", 0.0))) for doc in docs
         ]
@@ -488,8 +608,6 @@ class Searcher:
             f"(version={product_version}, alpha=0.3)"
         )
         self.logger.debug(f"[req: {request_id}] Query text: {short(query_text)}")
-        # Список пар (имя, запрос): коллекцию можно закомментировать,
-        # не правя распаковку результатов и логирование.
         pending = [
             (
                 product_name,
@@ -718,6 +836,150 @@ class Searcher:
 
         return merged
 
+    async def search_documents(
+        self,
+        query: str,
+        request_id: str,
+        top_k: int = 5,
+        context_chars: int = 60,
+        product_name: Optional[str] = None,
+        version: Optional[str] = None,
+        section: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        categories: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Поиск по коллекциям для /search. Фильтры применяются только если переданы."""
+        docs_start_time = time.perf_counter()
+        product_name = _clean_filter_value(product_name)
+        version = _clean_filter_value(version)
+        section = _clean_filter_value(section)
+        tags = _as_str_list(tags)
+        categories = _as_str_list(categories)
+
+        collections = list(self.product_collections.items())
+        if product_name:
+            slug_match = [
+                item for item in collections if item[0].lower() == product_name.lower()
+            ]
+            if slug_match:
+                collections = slug_match
+
+        weaviate_filter = catalog_filter(
+            product_name=product_name,
+            version=version,
+            section=section,
+            tags=tags,
+            categories=categories,
+        )
+        self.logger.info(
+            f"[req: {request_id}] Catalog search started: "
+            f"collections={[name for name, _ in collections]}, "
+            f"top_k={top_k}, context_chars={context_chars}, "
+            f"product_name={product_name}, version={version}, section={section}, "
+            f"tags={tags or None}, categories={categories or None}"
+        )
+        self.logger.debug(f"[req: {request_id}] Catalog query: {short(query)}")
+
+        if not collections or not query.strip():
+            self.logger.warning(f"[req: {request_id}] Catalog search skipped: empty query or no collections")
+            return []
+
+        return_properties = [
+            "title",
+            "page_content",
+            "page_url",
+            "source",
+            "product",
+            "product_name",
+            "version",
+            "section",
+            "tags",
+            "categories",
+        ]
+        pending = []
+        for product, collection in collections:
+            hybrid_kwargs = {
+                "query": query,
+                "alpha": 0.3,
+                "limit": 15,
+                "return_metadata": MetadataQuery(score=True),
+                "return_properties": return_properties,
+            }
+            if weaviate_filter is not None:
+                hybrid_kwargs["filters"] = weaviate_filter
+            pending.append((
+                product,
+                asyncio.to_thread(collection.query.hybrid, **hybrid_kwargs),
+            ))
+
+        fetch_start = time.perf_counter()
+        results = await asyncio.gather(*(task for _, task in pending))
+        self.logger.info(
+            f"[req: {request_id}] Catalog hybrid search in {time.perf_counter() - fetch_start:.3f}s: "
+            + ", ".join(
+                f"{name} - {len(res.objects or [])}"
+                for (name, _), res in zip(pending, results)
+            )
+        )
+
+        ranked_lists = []
+        for (product, _), res in zip(pending, results):
+            ranked_lists.append([
+                {
+                    "title": obj.properties.get("title", "") or "",
+                    "page_content": obj.properties.get("page_content", "") or "",
+                    "page_url": obj.properties.get("page_url", "") or "",
+                    "source": obj.properties.get("source", "") or "",
+                    "product": obj.properties.get("product", "") or product,
+                    "product_name": obj.properties.get("product_name", "") or "",
+                    "version": obj.properties.get("version", "") or "",
+                    "section": obj.properties.get("section", "") or "",
+                    "tags": _as_str_list(obj.properties.get("tags")),
+                    "categories": _as_str_list(obj.properties.get("categories")),
+                    "hybrid_score": obj.metadata.score or 0.0,
+                }
+                for obj in (res.objects or [])
+            ])
+
+        fused = self._fuse_rrf(ranked_lists)
+        raw_docs = fused[:SEARCH_CANDIDATES_LIMIT]
+        if not raw_docs:
+            self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
+            return []
+
+        scored_docs = await self.reranker.rerank.remote(
+            query, request_id, raw_docs, top_k=len(raw_docs), alpha=0.8
+        )
+        selected = self._select_diverse(scored_docs, top_k)
+
+        documents = []
+        for doc in selected:
+            documents.append({
+                "title": doc.get("title", ""),
+                "categories": doc.get("categories") or [],
+                "tags": doc.get("tags") or [],
+                "section": doc.get("section", ""),
+                "content": snippet_around_query(
+                    doc.get("page_content", ""), query, context_chars
+                ),
+                "page_url": doc.get("page_url", ""),
+                "product_name": doc.get("product_name") or doc.get("product", ""),
+                "version": doc.get("version", ""),
+            })
+
+        self.logger.info(
+            f"[req: {request_id}] Catalog search finished: {len(documents)} docs "
+            f"in {time.perf_counter() - docs_start_time:.3f}s"
+        )
+        for rank, doc in enumerate(documents, start=1):
+            self.logger.info(
+                f"[req: {request_id}] Hit #{rank} "
+                f"product={doc['product_name']} version={doc['version']} "
+                f"section={doc['section']} url={doc['page_url']}"
+            )
+            self.logger.debug(f"[req: {request_id}] Hit #{rank} snippet: {short(doc['content'])}")
+        return documents
+
     def close(self):
         if hasattr(self, "weaviate_connection") and self.weaviate_connection is not None:
             self.weaviate_connection.close()
@@ -771,7 +1033,6 @@ class RAGSystem:
                 enable_thinking=thinking,
             )
         except TypeError:
-            # шаблон модели не знает про enable_thinking
             return self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
@@ -1032,7 +1293,6 @@ class RAGSystem:
             self.logger.warning(f"[req: {request_id}] Query rewrite failed: {e}")
             return last_user_msg
 
-        # модель может вернуть <think> даже при выключенных рассуждениях
         result = self._strip_thinking(rewritten).strip().strip('"')
         self.logger.info(
             f"[req: {request_id}] Query rewritten: [{short(last_user_msg, 120)}] -> "
@@ -1141,8 +1401,6 @@ class RAGSystem:
             f"{short(search_query, 200)}"
         )
 
-        # HyDE считается параллельно с первым поиском, поэтому его латентность
-        # скрывается за retrieval. Второй проход делаем только если top-1 слабый.
         hyde_task = asyncio.create_task(self._generate_hyde(search_query, request_id))
         reranked_docs = await self.searcher.search.remote(
             queries=[search_query],
@@ -1264,7 +1522,6 @@ class SmartRouter:
         try:
             body: Dict[str, Any] = json.loads(raw_body)
         except json.JSONDecodeError as e:
-            # Чаще всего клиент присылает сырые переводы строк внутри JSON-строки
             self.logger.warning(
                 f"[req: {request_id}] Malformed JSON body ({len(raw_body)} bytes) "
                 f"at line {e.lineno} col {e.colno}: {e.msg}"
@@ -1400,34 +1657,32 @@ class SmartRouter:
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         search_start = time.perf_counter()
         self.logger.info(
-            f"[req: {request_id}] POST /search: product={req.product_name}, "
-            f"version={req.product_version}, top_k={req.top_k}"
+            f"[req: {request_id}] POST /search: top_k={req.top_k}, "
+            f"context_chars={req.context_chars}, product_name={req.product_name}, "
+            f"version={req.version}, section={req.section}, "
+            f"tags={req.tags}, categories={req.categories}"
         )
         self.logger.debug(f"[req: {request_id}] Search query: {short(req.query)}")
 
-        docs = await self.searcher.search.remote(
-            queries=[req.query],
-            product_name=req.product_name,
-            product_version=req.product_version,
-            top_k=req.top_k,
+        docs = await self.searcher.search_documents.remote(
+            query=req.query,
             request_id=request_id,
+            top_k=req.top_k,
+            context_chars=req.context_chars,
+            product_name=req.product_name,
+            version=req.version,
+            section=req.section,
+            tags=_as_str_list(req.tags),
+            categories=_as_str_list(req.categories),
         )
         self.logger.info(
             f"[req: {request_id}] /search returned {len(docs)} docs "
             f"in {time.perf_counter() - search_start:.3f}s"
         )
 
-        results = []
-        for doc in docs:
-            results.append(SearchResultDocument(
-                url=doc.get("page_url", ""),
-                score=doc.get("combined_score", 0.0),
-                content=doc.get("page_content", ""),
-                product_name=req.product_name,
-                product_version=req.product_version
-            ))
-            
-        return SearchResponse(results=results)
+        return SearchResponse(
+            results=[SearchResultDocument(**doc) for doc in docs]
+        )
 
 reranker_app = Reranker.bind()
 searcher_app = Searcher.bind(reranker_app)
