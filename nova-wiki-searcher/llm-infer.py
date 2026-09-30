@@ -40,7 +40,7 @@ def init_logger():
 
 logger = init_logger()
 
-PRODUCTS = [ "starguard", "kb" ]
+PRODUCTS = [ "starguard" ]
 
 DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
 DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
@@ -77,6 +77,78 @@ def _clean_filter_value(value: Optional[str]) -> Optional[str]:
     return text or None
 
 
+def _version_sort_key(version: str):
+    parts = []
+    for piece in version.split("."):
+        if piece.isdigit():
+            parts.append((0, int(piece)))
+        else:
+            parts.append((1, piece))
+    return parts
+
+
+def build_catalog(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Уникальные продукты с версиями, категории и теги по чанкам индекса.
+
+    Пустые строки не попадают в списки. Версии без product_name
+    присоединяются к единственному имени этого slug.
+    """
+    named_versions: Dict[tuple, set] = {}
+    unnamed_versions: Dict[str, set] = {}
+    name_counts: Dict[str, Dict[str, int]] = {}
+    categories = set()
+    tags = set()
+
+    for row in rows:
+        slug = str(row.get("product") or "").strip()
+        if not slug:
+            continue
+        name = str(row.get("product_name") or "").strip()
+        version = str(row.get("version") or "").strip()
+        if name:
+            counts = name_counts.setdefault(slug, {})
+            counts[name] = counts.get(name, 0) + 1
+            bucket = named_versions.setdefault((slug, name), set())
+            if version:
+                bucket.add(version)
+        elif version:
+            unnamed_versions.setdefault(slug, set()).add(version)
+        categories.update(_as_str_list(row.get("categories")))
+        tags.update(_as_str_list(row.get("tags")))
+
+    products = []
+    for slug in sorted(set(name_counts) | set(unnamed_versions)):
+        names = name_counts.get(slug, {})
+        if len(names) == 1:
+            name = next(iter(names))
+            versions = set(named_versions.get((slug, name), ()))
+            versions.update(unnamed_versions.get(slug, ()))
+            products.append({
+                "product": slug,
+                "product_name": name,
+                "versions": sorted(versions, key=_version_sort_key),
+            })
+        elif not names:
+            products.append({
+                "product": slug,
+                "product_name": "",
+                "versions": sorted(unnamed_versions.get(slug, ()), key=_version_sort_key),
+            })
+        else:
+            for name, _count in sorted(names.items(), key=lambda item: (-item[1], item[0])):
+                products.append({
+                    "product": slug,
+                    "product_name": name,
+                    "versions": sorted(named_versions.get((slug, name), ()), key=_version_sort_key),
+                })
+
+    return {
+        "products": products,
+        "categories": sorted(categories),
+        "tags": sorted(tags),
+    }
+
+
 def catalog_filter(
     product_name: Optional[str] = None,
     version: Optional[str] = None,
@@ -110,8 +182,11 @@ def catalog_filter(
 def snippet_around_query(text: str, query: str, radius: int = 60) -> str:
     """Фрагмент текста: radius символов по обе стороны от найденных слов запроса.
 
+    Слово из запроса длиной от 4 символов совпадает и с началом слова в тексте
+    («Установк» находит «установка»), в окно попадает слово целиком.
+    Более короткие слова ищутся только целиком.
     Если слова далеко друг от друга, берётся самое плотное скопление.
-    Если буквального совпадения нет, возвращается начало текста той же длины.
+    Если совпадения нет, возвращается начало текста той же длины.
     """
     if not text:
         return ""
@@ -121,10 +196,17 @@ def snippet_around_query(text: str, query: str, radius: int = 60) -> str:
     ]
     spans: List[tuple] = []
     for word in words:
-        pattern = re.compile(
-            rf"(?<!\w){re.escape(word)}(?!\w)",
-            flags=re.IGNORECASE | re.UNICODE,
-        )
+        # Короткий токен («ВМ») не разворачиваем в префикс: слишком много случайных слов.
+        if len(word) >= 4:
+            pattern = re.compile(
+                rf"(?<!\w){re.escape(word)}\w*",
+                flags=re.IGNORECASE | re.UNICODE,
+            )
+        else:
+            pattern = re.compile(
+                rf"(?<!\w){re.escape(word)}(?!\w)",
+                flags=re.IGNORECASE | re.UNICODE,
+            )
         spans.extend((match.start(), match.end()) for match in pattern.finditer(text))
 
     window = radius * 2
@@ -415,6 +497,20 @@ class SearchResultDocument(BaseModel):
 
 class SearchResponse(BaseModel):
     results: List[SearchResultDocument]
+
+class ProductInfo(BaseModel):
+    product: str
+    product_name: str
+    versions: List[str]
+
+class ProductsResponse(BaseModel):
+    products: List[ProductInfo]
+
+class CategoriesResponse(BaseModel):
+    categories: List[str]
+
+class TagsResponse(BaseModel):
+    tags: List[str]
 
 app = FastAPI()
 
@@ -995,6 +1091,44 @@ class Searcher:
             )
             self.logger.debug(f"[req: {request_id}] Hit #{rank} snippet: {short(doc['content'])}")
         return documents
+
+    async def list_catalog(self, request_id: str) -> Dict[str, Any]:
+        """Продукты с версиями, категории и теги по всем коллекциям /search."""
+        started = time.perf_counter()
+        self.logger.info(
+            f"[req: {request_id}] Catalog facets started: "
+            f"collections={list(self.product_collections)}"
+        )
+
+        def scan() -> List[Dict[str, Any]]:
+            rows = []
+            properties = ["product", "product_name", "version", "tags", "categories"]
+            for slug, collection in self.product_collections.items():
+                try:
+                    for obj in collection.iterator(
+                        include_vector=False,
+                        return_properties=properties,
+                    ):
+                        props = dict(obj.properties or {})
+                        if not str(props.get("product") or "").strip():
+                            props["product"] = slug
+                        rows.append(props)
+                except Exception as exc:
+                    self.logger.warning(
+                        f"[req: {request_id}] Facet scan failed for product '{slug}': {exc}"
+                    )
+            return rows
+
+        rows = await asyncio.to_thread(scan)
+        catalog = build_catalog(rows)
+        self.logger.info(
+            f"[req: {request_id}] Catalog facets: "
+            f"{len(catalog['products'])} products, "
+            f"{len(catalog['categories'])} categories, "
+            f"{len(catalog['tags'])} tags from {len(rows)} chunks "
+            f"in {time.perf_counter() - started:.3f}s"
+        )
+        return catalog
 
     def close(self):
         if hasattr(self, "weaviate_connection") and self.weaviate_connection is not None:
@@ -1699,6 +1833,24 @@ class SmartRouter:
         return SearchResponse(
             results=[SearchResultDocument(**doc) for doc in docs]
         )
+
+    @app.get("/products", response_model=ProductsResponse)
+    async def products_endpoint(self):
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        catalog = await self.searcher.list_catalog.remote(request_id)
+        return ProductsResponse(products=catalog["products"])
+
+    @app.get("/categories", response_model=CategoriesResponse)
+    async def categories_endpoint(self):
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        catalog = await self.searcher.list_catalog.remote(request_id)
+        return CategoriesResponse(categories=catalog["categories"])
+
+    @app.get("/tags", response_model=TagsResponse)
+    async def tags_endpoint(self):
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        catalog = await self.searcher.list_catalog.remote(request_id)
+        return TagsResponse(tags=catalog["tags"])
 
 reranker_app = Reranker.bind()
 searcher_app = Searcher.bind(reranker_app)
