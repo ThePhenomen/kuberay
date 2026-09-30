@@ -1,7 +1,7 @@
 import os
 import uuid
 import asyncio
-from typing import List, Dict, Any, AsyncGenerator, Optional
+from typing import List, Dict, Any, AsyncGenerator, Literal, Optional
 import json
 import math
 import time
@@ -174,6 +174,38 @@ def catalog_filter(
         clauses.append(Filter.by_property("categories").contains_all(categories))
     if not clauses:
         return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return Filter.all_of(clauses)
+
+
+def query_partial_words(query: str) -> List[str]:
+    """Слова запроса, которые ищем и как начало слова в тексте."""
+    return [
+        word for word in re.findall(r"\w+", query, flags=re.UNICODE) if len(word) >= 4
+    ]
+
+
+def text_has_partial_words(text: str, words: List[str]) -> bool:
+    haystack = text or ""
+    for word in words:
+        pattern = re.compile(
+            rf"(?<!\w){re.escape(word)}\w*",
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+        if pattern.search(haystack) is None:
+            return False
+    return True
+
+
+def partial_content_filter(words: List[str]):
+    """Weaviate Like: «Установк*» совпадает с токеном «установка»."""
+    if not words:
+        return None
+    clauses = [
+        Filter.by_property("page_content").like(f"{word}*")
+        for word in words
+    ]
     if len(clauses) == 1:
         return clauses[0]
     return Filter.all_of(clauses)
@@ -484,6 +516,8 @@ class SearchRequest(BaseModel):
     section: Optional[str] = None
     tags: Optional[str | List[str]] = None
     categories: Optional[str | List[str]] = None
+    # hybrid — BM25 и вектор. exact — слова запроса должны быть в тексте.
+    search_type: Literal["hybrid", "exact"] = "hybrid"
 
 class SearchResultDocument(BaseModel):
     title: str
@@ -943,6 +977,7 @@ class Searcher:
         section: Optional[str] = None,
         tags: Optional[List[str]] = None,
         categories: Optional[List[str]] = None,
+        search_type: str = "hybrid",
     ) -> List[Dict[str, Any]]:
         """Поиск по коллекциям для /search. Фильтры применяются только если переданы."""
         docs_start_time = time.perf_counter()
@@ -967,12 +1002,17 @@ class Searcher:
             tags=tags,
             categories=categories,
         )
+        exact = search_type == "exact"
+        partial_words = query_partial_words(query) if exact else []
+        partial_filter = partial_content_filter(partial_words)
         self.logger.info(
             f"[req: {request_id}] Catalog search started: "
             f"collections={[name for name, _ in collections]}, "
+            f"search_type={search_type}, "
             f"top_k={top_k}, context_chars={context_chars}, "
             f"product_name={product_name}, version={version}, section={section}, "
-            f"tags={tags or None}, categories={categories or None}"
+            f"tags={tags or None}, categories={categories or None}, "
+            f"partial_words={partial_words or None}"
         )
         self.logger.debug(f"[req: {request_id}] Catalog query: {short(query)}")
 
@@ -992,20 +1032,42 @@ class Searcher:
             "tags",
             "categories",
         ]
+        def run_hybrid(collection):
+            def call(use_partial: bool):
+                hybrid_kwargs = {
+                    "query": query,
+                    "alpha": 0.3,
+                    "limit": 30 if partial_words else 15,
+                    "return_metadata": MetadataQuery(score=True),
+                    "return_properties": return_properties,
+                }
+                clauses = []
+                if weaviate_filter is not None:
+                    clauses.append(weaviate_filter)
+                if use_partial and partial_filter is not None:
+                    clauses.append(partial_filter)
+                if len(clauses) == 1:
+                    hybrid_kwargs["filters"] = clauses[0]
+                elif clauses:
+                    hybrid_kwargs["filters"] = Filter.all_of(clauses)
+                return collection.query.hybrid(**hybrid_kwargs)
+
+            if partial_filter is None:
+                return call(False)
+            try:
+                return call(True)
+            except Exception as exc:
+                self.logger.warning(
+                    f"[req: {request_id}] Partial-word filter failed ({exc}); "
+                    "searching without it"
+                )
+                return call(False)
+
         pending = []
         for product, collection in collections:
-            hybrid_kwargs = {
-                "query": query,
-                "alpha": 0.3,
-                "limit": 15,
-                "return_metadata": MetadataQuery(score=True),
-                "return_properties": return_properties,
-            }
-            if weaviate_filter is not None:
-                hybrid_kwargs["filters"] = weaviate_filter
             pending.append((
                 product,
-                asyncio.to_thread(collection.query.hybrid, **hybrid_kwargs),
+                asyncio.to_thread(run_hybrid, collection),
             ))
 
         fetch_start = time.perf_counter()
@@ -1035,6 +1097,10 @@ class Searcher:
                     "hybrid_score": obj.metadata.score or 0.0,
                 }
                 for obj in (res.objects or [])
+                if not partial_words or text_has_partial_words(
+                    obj.properties.get("page_content", "") or "",
+                    partial_words,
+                )
             ])
 
         fused = self._fuse_rrf(ranked_lists)
@@ -1807,10 +1873,10 @@ class SmartRouter:
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         search_start = time.perf_counter()
         self.logger.info(
-            f"[req: {request_id}] POST /search: top_k={req.top_k}, "
-            f"context_chars={req.context_chars}, product_name={req.product_name}, "
-            f"version={req.version}, section={req.section}, "
-            f"tags={req.tags}, categories={req.categories}"
+            f"[req: {request_id}] POST /search: search_type={req.search_type}, "
+            f"top_k={req.top_k}, context_chars={req.context_chars}, "
+            f"product_name={req.product_name}, version={req.version}, "
+            f"section={req.section}, tags={req.tags}, categories={req.categories}"
         )
         self.logger.debug(f"[req: {request_id}] Search query: {short(req.query)}")
 
@@ -1824,6 +1890,7 @@ class SmartRouter:
             section=req.section,
             tags=_as_str_list(req.tags),
             categories=_as_str_list(req.categories),
+            search_type=req.search_type,
         )
         self.logger.info(
             f"[req: {request_id}] /search returned {len(docs)} docs "
