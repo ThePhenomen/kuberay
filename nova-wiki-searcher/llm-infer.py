@@ -197,18 +197,13 @@ def normalize_article_time(value: Any) -> str:
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def article_sort_time(published_at: str, updated_at: str) -> str:
-    """Дата для порядка страниц: изменение, а если его нет — публикация."""
-    return updated_at or published_at
-
-
 def order_pages_by_date(pages: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]:
-    """newest/oldest. Страницы без даты остаются в конце, в прежнем порядке."""
+    """newest/oldest по дате изменения. Страницы без даты остаются в конце."""
     if sort_by == "score":
         return pages
 
     def stamp(doc: Dict[str, Any]) -> str:
-        return article_sort_time(doc.get("published_at") or "", doc.get("updated_at") or "")
+        return doc.get("updated_at") or ""
 
     dated = [doc for doc in pages if stamp(doc)]
     undated = [doc for doc in pages if not stamp(doc)]
@@ -555,7 +550,7 @@ class SearchRequest(BaseModel):
     categories: Optional[str | List[str]] = None
     # hybrid — BM25 и вектор. exact — слова запроса должны быть в тексте.
     search_type: Literal["hybrid", "exact"] = "hybrid"
-    # score — релевантность. newest/oldest — по дате изменения, иначе публикации.
+    # score — релевантность. newest/oldest — по дате изменения.
     sort_by: Literal["score", "newest", "oldest"] = "score"
 
 class SearchResultDocument(BaseModel):
@@ -1089,7 +1084,8 @@ class Searcher:
                     ]
                 hybrid_kwargs = {
                     "query": query,
-                    "alpha": 0.3,
+                    # exact уже оставляет чанки со словами запроса, эмбеддинг их не фильтрует.
+                    "alpha": 0.0 if exact else 0.3,
                     "limit": fetch_limit,
                     "return_metadata": MetadataQuery(score=True),
                     "return_properties": properties,
@@ -1194,9 +1190,23 @@ class Searcher:
             self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
             return []
 
-        scored_docs = await self.reranker.rerank.remote(
-            query, request_id, raw_docs, top_k=len(raw_docs), alpha=0.8
-        )
+        # Реранкер только для гибридного поиска по релевантности.
+        # exact уже отобран BM25, порядок по дате задаёт updated_at.
+        use_rerank = (not exact) and sort_by == "score"
+        if use_rerank:
+            scored_docs = await self.reranker.rerank.remote(
+                query, request_id, raw_docs, top_k=len(raw_docs), alpha=0.8
+            )
+        else:
+            self.logger.info(
+                f"[req: {request_id}] Catalog rerank skipped: "
+                f"search_type={search_type}, sort_by={sort_by}"
+            )
+            scored_docs = raw_docs
+            for doc in scored_docs:
+                doc["combined_score"] = float(
+                    doc.get("rrf_score", doc.get("hybrid_score", 0.0))
+                )
         # Для каталожного поиска одна страница — один результат: чанк с лучшим score.
         # RAG по-прежнему может взять несколько чанков через _select_diverse.
         pages = []
