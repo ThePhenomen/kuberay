@@ -41,7 +41,7 @@ def init_logger():
 
 logger = init_logger()
 
-PRODUCTS = [ "starguard" ]
+PRODUCTS = [ "starguard", "kb" ]
 
 DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
 DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
@@ -360,12 +360,12 @@ RERANKER_NUM_GPUS = float(os.getenv("RERANKER_NUM_GPUS", "0.1"))
 
 LLM_MAX_MODEL_LEN = int(os.getenv("LLM_MAX_MODEL_LEN", "262144"))
 LLM_MAX_NUM_BATCHED_TOKENS = int(os.getenv("LLM_MAX_NUM_BATCHED_TOKENS", "8192"))
-LLM_GPU_MEMORY_UTILIZATION = float(os.getenv("LLM_GPU_MEMORY_UTILIZATION", "0.95"))
+LLM_GPU_MEMORY_UTILIZATION = float(os.getenv("LLM_GPU_MEMORY_UTILIZATION", "0.85"))
 LLM_KV_CACHE_DTYPE = os.getenv("LLM_KV_CACHE_DTYPE", "auto")
 
 RAG_LLM_ANSWER_THINKING = os.getenv("RAG_LLM_ANSWER_THINKING", "false").lower() in ("1", "true", "yes")
 
-RAG_ANSWER_MAX_TOKENS = int(os.getenv("RAG_ANSWER_MAX_TOKENS", "4096"))
+RAG_ANSWER_MAX_TOKENS = int(os.getenv("RAG_ANSWER_MAX_TOKENS", "8192"))
 SIMPLE_ANSWER_MAX_TOKENS = int(os.getenv("SIMPLE_ANSWER_MAX_TOKENS", "512"))
 REWRITE_MAX_TOKENS = int(os.getenv("REWRITE_MAX_TOKENS", "64"))
 HYDE_MAX_TOKENS = int(os.getenv("HYDE_MAX_TOKENS", "96"))
