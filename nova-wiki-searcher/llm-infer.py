@@ -1,6 +1,7 @@
 import os
 import uuid
 import asyncio
+from datetime import datetime, timezone
 from typing import List, Dict, Any, AsyncGenerator, Literal, Optional
 import json
 import math
@@ -177,6 +178,42 @@ def catalog_filter(
     if len(clauses) == 1:
         return clauses[0]
     return Filter.all_of(clauses)
+
+
+def normalize_article_time(value: Any) -> str:
+    """RFC3339 из меты в UTC `YYYY-MM-DDTHH:MM:SSZ`. Пустая строка, если даты нет."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def article_sort_time(published_at: str, updated_at: str) -> str:
+    """Дата для порядка страниц: изменение, а если его нет — публикация."""
+    return updated_at or published_at
+
+
+def order_pages_by_date(pages: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]:
+    """newest/oldest. Страницы без даты остаются в конце, в прежнем порядке."""
+    if sort_by == "score":
+        return pages
+
+    def stamp(doc: Dict[str, Any]) -> str:
+        return article_sort_time(doc.get("published_at") or "", doc.get("updated_at") or "")
+
+    dated = [doc for doc in pages if stamp(doc)]
+    undated = [doc for doc in pages if not stamp(doc)]
+    dated.sort(key=stamp, reverse=sort_by == "newest")
+    return dated + undated
 
 
 def query_partial_words(query: str) -> List[str]:
@@ -518,6 +555,8 @@ class SearchRequest(BaseModel):
     categories: Optional[str | List[str]] = None
     # hybrid — BM25 и вектор. exact — слова запроса должны быть в тексте.
     search_type: Literal["hybrid", "exact"] = "hybrid"
+    # score — релевантность. newest/oldest — по дате изменения, иначе публикации.
+    sort_by: Literal["score", "newest", "oldest"] = "score"
 
 class SearchResultDocument(BaseModel):
     title: str
@@ -528,6 +567,8 @@ class SearchResultDocument(BaseModel):
     page_url: str
     product_name: str
     version: str
+    published_at: str = ""
+    updated_at: str = ""
 
 class SearchResponse(BaseModel):
     results: List[SearchResultDocument]
@@ -978,6 +1019,7 @@ class Searcher:
         tags: Optional[List[str]] = None,
         categories: Optional[List[str]] = None,
         search_type: str = "hybrid",
+        sort_by: str = "score",
     ) -> List[Dict[str, Any]]:
         """Поиск по коллекциям для /search. Фильтры применяются только если переданы."""
         docs_start_time = time.perf_counter()
@@ -1008,7 +1050,7 @@ class Searcher:
         self.logger.info(
             f"[req: {request_id}] Catalog search started: "
             f"collections={[name for name, _ in collections]}, "
-            f"search_type={search_type}, "
+            f"search_type={search_type}, sort_by={sort_by}, "
             f"top_k={top_k}, context_chars={context_chars}, "
             f"product_name={product_name}, version={version}, section={section}, "
             f"tags={tags or None}, categories={categories or None}, "
@@ -1031,15 +1073,26 @@ class Searcher:
             "section",
             "tags",
             "categories",
+            "published_at",
+            "updated_at",
         ]
+        by_date = sort_by in ("newest", "oldest")
+        fetch_limit = 100 if by_date else (30 if partial_words else 15)
+
         def run_hybrid(collection):
-            def call(use_partial: bool):
+            def call(use_partial: bool, include_dates: bool):
+                properties = return_properties
+                if not include_dates:
+                    properties = [
+                        name for name in return_properties
+                        if name not in ("published_at", "updated_at")
+                    ]
                 hybrid_kwargs = {
                     "query": query,
                     "alpha": 0.3,
-                    "limit": 30 if partial_words else 15,
+                    "limit": fetch_limit,
                     "return_metadata": MetadataQuery(score=True),
-                    "return_properties": return_properties,
+                    "return_properties": properties,
                 }
                 clauses = []
                 if weaviate_filter is not None:
@@ -1052,16 +1105,45 @@ class Searcher:
                     hybrid_kwargs["filters"] = Filter.all_of(clauses)
                 return collection.query.hybrid(**hybrid_kwargs)
 
-            if partial_filter is None:
-                return call(False)
+            def missing_dates(exc: Exception) -> bool:
+                message = str(exc)
+                return "published_at" in message or "updated_at" in message
+
+            use_partial = partial_filter is not None
             try:
-                return call(True)
+                return call(use_partial, True)
             except Exception as exc:
+                if missing_dates(exc):
+                    self.logger.warning(
+                        f"[req: {request_id}] Date properties are not in the collection "
+                        f"({exc}); searching without them"
+                    )
+                    try:
+                        return call(use_partial, False)
+                    except Exception as retry_exc:
+                        if not use_partial:
+                            raise
+                        self.logger.warning(
+                            f"[req: {request_id}] Partial-word filter failed ({retry_exc}); "
+                            "searching without it"
+                        )
+                        return call(False, False)
+                if not use_partial:
+                    raise
                 self.logger.warning(
                     f"[req: {request_id}] Partial-word filter failed ({exc}); "
                     "searching without it"
                 )
-                return call(False)
+                try:
+                    return call(False, True)
+                except Exception as retry_exc:
+                    if not missing_dates(retry_exc):
+                        raise
+                    self.logger.warning(
+                        f"[req: {request_id}] Date properties are not in the collection "
+                        f"({retry_exc}); searching without them"
+                    )
+                    return call(False, False)
 
         pending = []
         for product, collection in collections:
@@ -1094,6 +1176,8 @@ class Searcher:
                     "section": obj.properties.get("section", "") or "",
                     "tags": _as_str_list(obj.properties.get("tags")),
                     "categories": _as_str_list(obj.properties.get("categories")),
+                    "published_at": normalize_article_time(obj.properties.get("published_at")),
+                    "updated_at": normalize_article_time(obj.properties.get("updated_at")),
                     "hybrid_score": obj.metadata.score or 0.0,
                 }
                 for obj in (res.objects or [])
@@ -1104,7 +1188,8 @@ class Searcher:
             ])
 
         fused = self._fuse_rrf(ranked_lists)
-        raw_docs = fused[:SEARCH_CANDIDATES_LIMIT]
+        candidate_limit = fetch_limit if by_date else SEARCH_CANDIDATES_LIMIT
+        raw_docs = fused[:candidate_limit]
         if not raw_docs:
             self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
             return []
@@ -1114,19 +1199,19 @@ class Searcher:
         )
         # Для каталожного поиска одна страница — один результат: чанк с лучшим score.
         # RAG по-прежнему может взять несколько чанков через _select_diverse.
-        selected = []
+        pages = []
         seen_pages = set()
         for doc in scored_docs:
             page = (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
             if not page or page in seen_pages:
                 continue
             seen_pages.add(page)
-            selected.append(doc)
-            if len(selected) >= top_k:
-                break
+            pages.append(doc)
+        pages = order_pages_by_date(pages, sort_by)
+        selected = pages[:top_k]
         self.logger.info(
             f"[req: {request_id}] Collapsed {len(scored_docs)} chunks "
-            f"to {len(selected)} pages"
+            f"to {len(pages)} pages, sort_by={sort_by}, returning {len(selected)}"
         )
 
         documents = []
@@ -1142,6 +1227,8 @@ class Searcher:
                 "page_url": doc.get("page_url", ""),
                 "product_name": doc.get("product_name") or doc.get("product", ""),
                 "version": doc.get("version", ""),
+                "published_at": doc.get("published_at") or "",
+                "updated_at": doc.get("updated_at") or "",
             })
 
         self.logger.info(
@@ -1874,7 +1961,7 @@ class SmartRouter:
         search_start = time.perf_counter()
         self.logger.info(
             f"[req: {request_id}] POST /search: search_type={req.search_type}, "
-            f"top_k={req.top_k}, context_chars={req.context_chars}, "
+            f"sort_by={req.sort_by}, top_k={req.top_k}, context_chars={req.context_chars}, "
             f"product_name={req.product_name}, version={req.version}, "
             f"section={req.section}, tags={req.tags}, categories={req.categories}"
         )
@@ -1891,6 +1978,7 @@ class SmartRouter:
             tags=_as_str_list(req.tags),
             categories=_as_str_list(req.categories),
             search_type=req.search_type,
+            sort_by=req.sort_by,
         )
         self.logger.info(
             f"[req: {request_id}] /search returned {len(docs)} docs "
