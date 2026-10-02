@@ -1050,8 +1050,8 @@ class Searcher:
         )
         exact = search_type == "exact"
         words = query_words(query) if exact else []
-        # Одно слово длиннее 3 символов ищем как подстроку. Несколько слов — BM25 AND.
-        like_word = words[0] if len(words) == 1 and len(words[0]) > 3 else ""
+        # Одно слово — like по подстроке. Несколько слов — BM25 AND.
+        like_word = words[0] if len(words) == 1 and len(words[0]) >= 3 else ""
         self.logger.info(
             f"[req: {request_id}] Catalog search started: "
             f"collections={[name for name, _ in collections]}, "
