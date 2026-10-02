@@ -19,7 +19,10 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.query import BM25Operator, Filter, GroupBy, MetadataQuery
+from weaviate.classes.query import BM25Operator, Filter, GroupBy, MetadataQuery, Sort
+from weaviate.collections.classes.internal import _GroupBy, _QueryOptions
+from weaviate.connect import executor
+from weaviate.proto.v1 import search_get_pb2
 
 import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -350,7 +353,6 @@ RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "6000"))
 RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "16"))
 
 RRF_K = int(os.getenv("RRF_K", "60"))
-SEARCH_CANDIDATES_LIMIT = int(os.getenv("SEARCH_CANDIDATES_LIMIT", "40"))
 SEARCH_PER_PAGE_CAP = int(os.getenv("SEARCH_PER_PAGE_CAP", "2"))
 
 HYDE_RERANK_THRESHOLD = float(os.getenv("HYDE_RERANK_THRESHOLD", "0.0"))
@@ -952,7 +954,7 @@ class Searcher:
 
         ranked_lists = [ranked for lists in per_query_lists for ranked in lists]
         fused = self._fuse_rrf(ranked_lists)
-        raw_docs = fused[:SEARCH_CANDIDATES_LIMIT]
+        raw_docs = fused[:top_k + 10]
 
         docs_end_time = time.perf_counter()
         self.logger.info(
@@ -1082,8 +1084,6 @@ class Searcher:
             "updated_at",
         ]
         by_date = sort_by in ("newest", "oldest")
-        # group_by режет уже найденные объекты, поэтому окно шире, чем число страниц.
-        object_limit = max(top_k * 10, top_k)
         page_group = GroupBy(
             prop="page_url",
             number_of_groups=top_k,
@@ -1097,6 +1097,13 @@ class Searcher:
                 Filter.by_property("page_content").like(f"*{like_word.casefold()}*")
             )
         if by_date:
+            # Сортировка по дате — это fetch, а не добор кандидатов.
+            # Слова запроса остаются фильтром, чтобы в выдачу не попал весь каталог.
+            for word in query_words(query):
+                if len(word) >= 3 and word.casefold() != like_word.casefold():
+                    clauses.append(
+                        Filter.by_property("page_content").like(f"*{word.casefold()}*")
+                    )
             clauses.append(Filter.by_property("updated_at").is_none(False))
         query_filter = None
         if len(clauses) == 1:
@@ -1104,14 +1111,52 @@ class Searcher:
         elif clauses:
             query_filter = Filter.all_of(clauses)
 
+        def fetch_by_date(collection):
+            """Get + sort по updated_at + одна группа на page_url. Лимит — число страниц."""
+            query_api = collection.query
+            request = query_api._query._QueryGRPC__create_request(
+                limit=top_k,
+                filters=query_filter,
+                group_by=_GroupBy.from_input(page_group),
+                sort_by=[
+                    search_get_pb2.SortBy(
+                        ascending=sort_by == "oldest",
+                        path=["updated_at"],
+                    )
+                ],
+                return_properties=query_api._parse_return_properties(return_properties),
+            )
+
+            def resp(res):
+                return query_api._result_to_query_or_groupby_return(
+                    res,
+                    _QueryOptions.from_input(
+                        None,
+                        return_properties,
+                        False,
+                        query_api._references,
+                        None,
+                        None,
+                        page_group,
+                    ),
+                )
+
+            return executor.execute(
+                response_callback=resp,
+                method=query_api._connection.grpc_search,
+                request=request,
+            )
+
         def run_query(collection):
             # Одна группа — одна страница. Внутри группы один чанк, его текст идёт в ответ.
+            if by_date:
+                return fetch_by_date(collection)
             if like_word:
                 return collection.query.bm25(
                     query=None,
                     filters=query_filter,
                     group_by=page_group,
-                    limit=object_limit,
+                    limit=top_k,
                     return_properties=return_properties,
                 )
             if exact:
@@ -1120,14 +1165,14 @@ class Searcher:
                     operator=BM25Operator.and_(),
                     filters=query_filter,
                     group_by=page_group,
-                    limit=object_limit,
+                    limit=top_k,
                     return_metadata=MetadataQuery(score=True),
                     return_properties=return_properties,
                 )
             return collection.query.hybrid(
                 query=query,
                 alpha=0.3,
-                limit=object_limit,
+                limit=top_k,
                 filters=query_filter,
                 group_by=page_group,
                 return_metadata=MetadataQuery(score=True),
