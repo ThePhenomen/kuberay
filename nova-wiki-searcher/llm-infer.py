@@ -9,7 +9,7 @@ import time
 import torch
 import re
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from ray import serve
@@ -19,7 +19,7 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.query import Filter, MetadataQuery
+from weaviate.classes.query import BM25Operator, Filter, GroupBy, MetadataQuery
 
 import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -41,9 +41,9 @@ def init_logger():
 
 logger = init_logger()
 
-PRODUCTS = [ "starguard", "kb" ]
-
-DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or PRODUCTS[0]
+# Коллекции не перечисляются: Searcher читает алиасы Weaviate с префиксом COLLECTION_NAME.
+# Это имя нужно только как запасной продукт для чата, если в запросе продукт неизвестен.
+DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or "starguard"
 DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
 
 LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
@@ -211,36 +211,16 @@ def order_pages_by_date(pages: List[Dict[str, Any]], sort_by: str) -> List[Dict[
     return dated + undated
 
 
-def query_partial_words(query: str) -> List[str]:
-    """Слова запроса, которые ищем и как начало слова в тексте."""
-    return [
-        word for word in re.findall(r"\w+", query, flags=re.UNICODE) if len(word) >= 4
-    ]
+def query_words(query: str) -> List[str]:
+    """Слова запроса. Короче 3 символов /search не принимает."""
+    return re.findall(r"\w+", query, flags=re.UNICODE)
 
 
-def text_has_partial_words(text: str, words: List[str]) -> bool:
-    haystack = text or ""
-    for word in words:
-        pattern = re.compile(
-            rf"(?<!\w){re.escape(word)}\w*",
-            flags=re.IGNORECASE | re.UNICODE,
-        )
-        if pattern.search(haystack) is None:
-            return False
-    return True
-
-
-def partial_content_filter(words: List[str]):
-    """Weaviate Like: «Установк*» совпадает с токеном «установка»."""
-    if not words:
-        return None
-    clauses = [
-        Filter.by_property("page_content").like(f"{word}*")
-        for word in words
-    ]
-    if len(clauses) == 1:
-        return clauses[0]
-    return Filter.all_of(clauses)
+def query_too_short_message(query: str) -> Optional[str]:
+    words = query_words(query)
+    if not any(len(word) >= 3 for word in words):
+        return "Запрос должен содержать слово длиной не меньше 3 символов."
+    return None
 
 
 def snippet_around_query(text: str, query: str, radius: int = 60) -> str:
@@ -734,36 +714,65 @@ class Searcher:
             self.weaviate_connection.close()
             raise RuntimeError("Weaviate is not ready, aborting Searcher initialization")
         
-        self.product_collections = {}
-        aliases = {}
-        for product in PRODUCTS:
-            product_alias = f"{COLLECTION_NAME}{product.replace('-', '_').capitalize()}"
-            aliases[product] = product_alias
-            self.product_collections[product] = self.weaviate_connection.collections.use(product_alias)
-
+        self.product_collections = self._discover_collections()
+        known = sorted(self.product_collections)
+        self.default_product = DEFAULT_PRODUCT if DEFAULT_PRODUCT in self.product_collections else (known[0] if known else "")
+        if not self.product_collections:
+            raise RuntimeError(
+                f"No Weaviate aliases starting with '{COLLECTION_NAME}'. "
+                "Catalog search and RAG have no collections."
+            )
         self.logger.info(
             f"Weaviate ready at {WEAVIATE_HTTP_ADDR}:{WEAVIATE_HTTP_PORT}, "
-            f"default product '{DEFAULT_PRODUCT}', mapped {len(aliases)} collections"
+            f"default product '{self.default_product}', discovered {len(known)} collections"
         )
-        for product, alias in aliases.items():
-            self.logger.info(f"  product '{product}' -> collection '{alias}'")
+        for product, collection in self.product_collections.items():
+            self.logger.info(f"  product '{product}' -> collection '{collection.name}'")
+
+    def _discover_collections(self) -> Dict[str, Any]:
+        """Алиасы вида NewWikiDocsStarguard. Промежуточные коллекции с суффиксом _<timestamp> пропускаются."""
+        prefix = COLLECTION_NAME
+        found: Dict[str, str] = {}
+
+        def take(name: str) -> None:
+            if not name.startswith(prefix):
+                return
+            suffix = name[len(prefix):]
+            if not suffix or re.search(r"_\d+$", suffix):
+                return
+            found[suffix.replace("_", "-").lower()] = name
+
+        try:
+            for alias_name in self.weaviate_connection.alias.list_all():
+                take(alias_name)
+        except Exception as exc:
+            self.logger.warning(f"Alias discovery failed ({exc}); reading collection names")
+
+        if not found:
+            for name in self.weaviate_connection.collections.list_all(simple=True):
+                take(name)
+
+        return {
+            slug: self.weaviate_connection.collections.use(alias)
+            for slug, alias in sorted(found.items())
+        }
 
     async def _fetch_docs_parallel(self, query_text: str, product_name: str, product_version: str, request_id: str) -> List[List[Dict[str, Any]]]:
         """Возвращает ранжированные списки по коллекциям — отдельно, для RRF."""
         collection = self.product_collections.get(product_name)
         if collection is None:
-            fallback = self.product_collections.get(DEFAULT_PRODUCT)
+            fallback = self.product_collections.get(self.default_product)
             if fallback is None:
                 raise RuntimeError(
                     f"[req: {request_id}] No collection for product '{product_name}', "
-                    f"and default product '{DEFAULT_PRODUCT}' is not in PRODUCTS={PRODUCTS}"
+                    f"and default product '{self.default_product}' was not discovered"
                 )
             self.logger.warning(
                 f"[req: {request_id}] Unknown product '{product_name}', "
-                f"falling back to '{DEFAULT_PRODUCT}'"
+                f"falling back to '{self.default_product}'"
             )
             collection = fallback
-            product_name = DEFAULT_PRODUCT
+            product_name = self.default_product
 
         version = "latest" if product_name == "zvirt" else product_name
 
@@ -1040,8 +1049,9 @@ class Searcher:
             categories=categories,
         )
         exact = search_type == "exact"
-        partial_words = query_partial_words(query) if exact else []
-        partial_filter = partial_content_filter(partial_words)
+        words = query_words(query) if exact else []
+        # Одно слово длиннее 3 символов ищем как подстроку. Несколько слов — BM25 AND.
+        like_word = words[0] if len(words) == 1 and len(words[0]) > 3 else ""
         self.logger.info(
             f"[req: {request_id}] Catalog search started: "
             f"collections={[name for name, _ in collections]}, "
@@ -1049,7 +1059,7 @@ class Searcher:
             f"top_k={top_k}, context_chars={context_chars}, "
             f"product_name={product_name}, version={version}, section={section}, "
             f"tags={tags or None}, categories={categories or None}, "
-            f"partial_words={partial_words or None}"
+            f"like_word={like_word or None}, words={words or None}"
         )
         self.logger.debug(f"[req: {request_id}] Catalog query: {short(query)}")
 
@@ -1072,94 +1082,82 @@ class Searcher:
             "updated_at",
         ]
         by_date = sort_by in ("newest", "oldest")
-        fetch_limit = 100 if by_date else (30 if partial_words else 15)
+        # group_by режет уже найденные объекты, поэтому окно шире, чем число страниц.
+        object_limit = max(top_k * 10, top_k)
+        page_group = GroupBy(
+            prop="page_url",
+            number_of_groups=top_k,
+            objects_per_group=1,
+        )
+        clauses = []
+        if weaviate_filter is not None:
+            clauses.append(weaviate_filter)
+        if like_word:
+            clauses.append(
+                Filter.by_property("page_content").like(f"*{like_word.casefold()}*")
+            )
+        if by_date:
+            clauses.append(Filter.by_property("updated_at").is_none(False))
+        query_filter = None
+        if len(clauses) == 1:
+            query_filter = clauses[0]
+        elif clauses:
+            query_filter = Filter.all_of(clauses)
 
-        def run_hybrid(collection):
-            def call(use_partial: bool, include_dates: bool):
-                properties = return_properties
-                if not include_dates:
-                    properties = [
-                        name for name in return_properties
-                        if name not in ("published_at", "updated_at")
-                    ]
-                hybrid_kwargs = {
-                    "query": query,
-                    # exact уже оставляет чанки со словами запроса, эмбеддинг их не фильтрует.
-                    "alpha": 0.0 if exact else 0.3,
-                    "limit": fetch_limit,
-                    "return_metadata": MetadataQuery(score=True),
-                    "return_properties": properties,
-                }
-                clauses = []
-                if weaviate_filter is not None:
-                    clauses.append(weaviate_filter)
-                if use_partial and partial_filter is not None:
-                    clauses.append(partial_filter)
-                if len(clauses) == 1:
-                    hybrid_kwargs["filters"] = clauses[0]
-                elif clauses:
-                    hybrid_kwargs["filters"] = Filter.all_of(clauses)
-                return collection.query.hybrid(**hybrid_kwargs)
-
-            def missing_dates(exc: Exception) -> bool:
-                message = str(exc)
-                return "published_at" in message or "updated_at" in message
-
-            use_partial = partial_filter is not None
-            try:
-                return call(use_partial, True)
-            except Exception as exc:
-                if missing_dates(exc):
-                    self.logger.warning(
-                        f"[req: {request_id}] Date properties are not in the collection "
-                        f"({exc}); searching without them"
-                    )
-                    try:
-                        return call(use_partial, False)
-                    except Exception as retry_exc:
-                        if not use_partial:
-                            raise
-                        self.logger.warning(
-                            f"[req: {request_id}] Partial-word filter failed ({retry_exc}); "
-                            "searching without it"
-                        )
-                        return call(False, False)
-                if not use_partial:
-                    raise
-                self.logger.warning(
-                    f"[req: {request_id}] Partial-word filter failed ({exc}); "
-                    "searching without it"
+        def run_query(collection):
+            # Одна группа — одна страница. Внутри группы один чанк, его текст идёт в ответ.
+            if like_word:
+                return collection.query.bm25(
+                    query=None,
+                    filters=query_filter,
+                    group_by=page_group,
+                    limit=object_limit,
+                    return_properties=return_properties,
                 )
-                try:
-                    return call(False, True)
-                except Exception as retry_exc:
-                    if not missing_dates(retry_exc):
-                        raise
-                    self.logger.warning(
-                        f"[req: {request_id}] Date properties are not in the collection "
-                        f"({retry_exc}); searching without them"
-                    )
-                    return call(False, False)
+            if exact:
+                return collection.query.bm25(
+                    query=query,
+                    operator=BM25Operator.and_(),
+                    filters=query_filter,
+                    group_by=page_group,
+                    limit=object_limit,
+                    return_metadata=MetadataQuery(score=True),
+                    return_properties=return_properties,
+                )
+            return collection.query.hybrid(
+                query=query,
+                alpha=0.3,
+                limit=object_limit,
+                filters=query_filter,
+                group_by=page_group,
+                return_metadata=MetadataQuery(score=True),
+                return_properties=return_properties,
+            )
 
-        pending = []
-        for product, collection in collections:
-            pending.append((
-                product,
-                asyncio.to_thread(run_hybrid, collection),
-            ))
+        def grouped_objects(res):
+            groups = getattr(res, "groups", None) or {}
+            if groups:
+                found = []
+                for group in groups.values():
+                    if group.objects:
+                        found.append(group.objects[0])
+                return found
+            return list(res.objects or [])
 
+        pending = [
+            (product, asyncio.to_thread(run_query, collection))
+            for product, collection in collections
+        ]
         fetch_start = time.perf_counter()
         results = await asyncio.gather(*(task for _, task in pending))
+        grouped = [(name, grouped_objects(res)) for (name, _), res in zip(pending, results)]
         self.logger.info(
-            f"[req: {request_id}] Catalog hybrid search in {time.perf_counter() - fetch_start:.3f}s: "
-            + ", ".join(
-                f"{name} - {len(res.objects or [])}"
-                for (name, _), res in zip(pending, results)
-            )
+            f"[req: {request_id}] Catalog search in {time.perf_counter() - fetch_start:.3f}s: "
+            + ", ".join(f"{name} - {len(objects)} pages" for name, objects in grouped)
         )
 
         ranked_lists = []
-        for (product, _), res in zip(pending, results):
+        for product, objects in grouped:
             ranked_lists.append([
                 {
                     "title": obj.properties.get("title", "") or "",
@@ -1174,24 +1172,21 @@ class Searcher:
                     "categories": _as_str_list(obj.properties.get("categories")),
                     "published_at": normalize_article_time(obj.properties.get("published_at")),
                     "updated_at": normalize_article_time(obj.properties.get("updated_at")),
-                    "hybrid_score": obj.metadata.score or 0.0,
+                    "hybrid_score": (
+                        (obj.metadata.score or 0.0) if obj.metadata is not None else 0.0
+                    ),
                 }
-                for obj in (res.objects or [])
-                if not partial_words or text_has_partial_words(
-                    obj.properties.get("page_content", "") or "",
-                    partial_words,
-                )
+                for obj in objects
             ])
 
         fused = self._fuse_rrf(ranked_lists)
-        candidate_limit = fetch_limit if by_date else SEARCH_CANDIDATES_LIMIT
-        raw_docs = fused[:candidate_limit]
+        raw_docs = fused
         if not raw_docs:
             self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
             return []
 
         # Реранкер только для гибридного поиска по релевантности.
-        # exact уже отобран BM25, порядок по дате задаёт updated_at.
+        # exact — like или BM25 AND, порядок по дате задаёт updated_at уже по страницам.
         use_rerank = (not exact) and sort_by == "score"
         if use_rerank:
             scored_docs = await self.reranker.rerank.remote(
@@ -1220,8 +1215,8 @@ class Searcher:
         pages = order_pages_by_date(pages, sort_by)
         selected = pages[:top_k]
         self.logger.info(
-            f"[req: {request_id}] Collapsed {len(scored_docs)} chunks "
-            f"to {len(pages)} pages, sort_by={sort_by}, returning {len(selected)}"
+            f"[req: {request_id}] Grouped {len(scored_docs)} pages, "
+            f"sort_by={sort_by}, returning {len(selected)}"
         )
 
         documents = []
@@ -1815,7 +1810,7 @@ class SmartRouter:
         self.logger = init_logger()
         self.logger.info(
             f"SmartRouter ready: default product='{DEFAULT_PRODUCT}', "
-            f"version='{DEFAULT_PRODUCT_VERSION}', known products={PRODUCTS}"
+            f"version='{DEFAULT_PRODUCT_VERSION}', collections discovered from Weaviate aliases"
         )
 
     @app.get("/v1/models")
@@ -1889,12 +1884,6 @@ class SmartRouter:
             f"[req: {request_id}] Unknown body keys: "
             f"{sorted(set(body) - {'model', 'messages', 'stream', 'product_name', 'product_version', 'user_request'})}"
         )
-
-        if product_name not in PRODUCTS:
-            self.logger.warning(
-                f"[req: {request_id}] Product '{product_name}' is not in PRODUCTS={PRODUCTS}, "
-                f"search will fall back to '{DEFAULT_PRODUCT}'"
-            )
 
         if not messages:
             self.logger.warning(f"[req: {request_id}] Empty 'messages' in request body")
@@ -1976,6 +1965,10 @@ class SmartRouter:
             f"section={req.section}, tags={req.tags}, categories={req.categories}"
         )
         self.logger.debug(f"[req: {request_id}] Search query: {short(req.query)}")
+        short_query = query_too_short_message(req.query)
+        if short_query:
+            self.logger.info(f"[req: {request_id}] /search rejected: {short_query}")
+            raise HTTPException(status_code=400, detail=short_query)
 
         docs = await self.searcher.search_documents.remote(
             query=req.query,
