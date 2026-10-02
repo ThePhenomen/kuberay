@@ -1139,7 +1139,7 @@ class Searcher:
                 )
             return collection.query.hybrid(
                 query=query,
-                alpha=0.3,
+                alpha=0.2,
                 limit=top_k,
                 filters=query_filter,
                 group_by=page_group,
