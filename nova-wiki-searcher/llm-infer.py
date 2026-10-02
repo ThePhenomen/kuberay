@@ -226,9 +226,9 @@ def query_too_short_message(query: str) -> Optional[str]:
 def snippet_around_query(text: str, query: str, radius: int = 60) -> str:
     """Фрагмент текста: radius символов по обе стороны от найденных слов запроса.
 
-    Слово из запроса длиной от 4 символов совпадает и с началом слова в тексте
-    («Установк» находит «установка»), в окно попадает слово целиком.
-    Более короткие слова ищутся только целиком.
+    Слово длиннее 3 символов ищется как подстрока, как фильтр like.
+    «Установк» находит и «установка», и вхождение внутри другого слова.
+    В окно попадает слово целиком. Слова короче 4 символов ищутся только целиком.
     Если слова далеко друг от друга, берётся самое плотное скопление.
     Если совпадения нет, возвращается начало текста той же длины.
     """
@@ -240,18 +240,22 @@ def snippet_around_query(text: str, query: str, radius: int = 60) -> str:
     ]
     spans: List[tuple] = []
     for word in words:
-        # Короткий токен («ВМ») не разворачиваем в префикс: слишком много случайных слов.
+        # Короткий токен («ВМ») не ищем как подстроку: слишком много случайных слов.
         if len(word) >= 4:
-            pattern = re.compile(
-                rf"(?<!\w){re.escape(word)}\w*",
-                flags=re.IGNORECASE | re.UNICODE,
-            )
+            pattern = re.compile(re.escape(word), flags=re.IGNORECASE | re.UNICODE)
         else:
             pattern = re.compile(
                 rf"(?<!\w){re.escape(word)}(?!\w)",
                 flags=re.IGNORECASE | re.UNICODE,
             )
-        spans.extend((match.start(), match.end()) for match in pattern.finditer(text))
+        for match in pattern.finditer(text):
+            start, end = match.start(), match.end()
+            if len(word) >= 4:
+                while start > 0 and re.match(r"\w", text[start - 1], flags=re.UNICODE):
+                    start -= 1
+                while end < len(text) and re.match(r"\w", text[end], flags=re.UNICODE):
+                    end += 1
+            spans.append((start, end))
 
     window = radius * 2
     if not spans:
