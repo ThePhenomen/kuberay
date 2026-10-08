@@ -11,7 +11,7 @@ import re
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ray import serve
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -30,21 +30,23 @@ logging.basicConfig(
 )
 
 def init_logger():
-    """Get the service logger.
-
-    Уровень выставляется явно: в воркерах Ray Serve конфиг root-логгера
-    переопределяется, из-за чего LOG_LEVEL=DEBUG иначе не срабатывает.
-    """
+    """Get the service logger."""
     service_logger = logging.getLogger("rag_service")
     service_logger.setLevel(LOG_LEVEL)
     return service_logger
 
 logger = init_logger()
 
-# Коллекции не перечисляются: Searcher читает алиасы Weaviate с префиксом COLLECTION_NAME.
-# Это имя нужно только как запасной продукт для чата, если в запросе продукт неизвестен.
 DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or "starguard"
 DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
+# Weaviate применяет limit до group_by, поэтому несколько чанков одной страницы
+# съедают лимит. Небольшой запас объектов нужен, чтобы после склейки осталось
+# запрошенное число страниц.
+CATALOG_GROUP_SLACK = 10
+# Сырая оценка bge-reranker-v2-m3. Выше 0 модель считает страницу релевантной
+# (вероятность больше 0.5). Нормированный combined_score для порога не годится:
+# внутри пачки лучшая страница всегда получает 1, даже если запрос ни о чём.
+CATALOG_RERANK_MIN_SCORE = float(os.getenv("CATALOG_RERANK_MIN_SCORE", "0"))
 
 LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
 
@@ -160,7 +162,6 @@ def catalog_filter(
     """Weaviate-фильтр только из переданных полей. None — ограничения нет."""
     clauses = []
     if product_name:
-        # В индексе лежат и slug (product), и имя из article:product.
         clauses.append(Filter.any_of([
             Filter.by_property("product_name").equal(product_name),
             Filter.by_property("product").equal(product_name),
@@ -240,7 +241,6 @@ def snippet_around_query(text: str, query: str, radius: int = 60) -> str:
     ]
     spans: List[tuple] = []
     for word in words:
-        # Короткий токен («ВМ») не ищем как подстроку: слишком много случайных слов.
         if len(word) >= 4:
             pattern = re.compile(re.escape(word), flags=re.IGNORECASE | re.UNICODE)
         else:
@@ -308,21 +308,6 @@ def snippet_around_query(text: str, query: str, radius: int = 60) -> str:
     if end < len(text):
         snippet = snippet + "…"
     return snippet
-
-# PRODUCTS = [
-#     "nova",
-#     "zvirt",
-#     "zvirt-containers",
-#     "zvirt-metrics",
-#     "zvirt-dc-manager",
-#     "terraform",
-#     "termit",
-#     "cloudlink",
-#     "nova-se",
-#     "starvault",
-#     "knowledgebase", 
-#     "solutions",
-# ]
 
 RERANKER_MODEL_ID = os.getenv("RERANKER_MODEL_ID", "BAAI/bge-reranker-v2-m3")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "NewWikiDocs")
@@ -523,17 +508,15 @@ class ChatCompletionResponse(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 5
-    # символов контекста по обе стороны от найденных слов
+    page: int = Field(default=1, ge=1)
+    count: Optional[int] = Field(default=None, ge=1, le=100)
     context_chars: int = 60
-    # Пустое значение не фильтрует. tags и categories — документ должен содержать все указанные.
     product_name: Optional[str] = None
     version: Optional[str] = None
     section: Optional[str] = None
     tags: Optional[str | List[str]] = None
     categories: Optional[str | List[str]] = None
-    # hybrid — BM25 и вектор. exact — слова запроса должны быть в тексте.
     search_type: Literal["hybrid", "exact"] = "hybrid"
-    # score — релевантность. newest/oldest — по дате изменения.
     sort_by: Literal["score", "newest", "oldest"] = "score"
 
 class SearchResultDocument(BaseModel):
@@ -550,6 +533,9 @@ class SearchResultDocument(BaseModel):
 
 class SearchResponse(BaseModel):
     results: List[SearchResultDocument]
+    total: int
+    page: int
+    count: int
 
 class ProductInfo(BaseModel):
     product: str
@@ -1019,6 +1005,8 @@ class Searcher:
         query: str,
         request_id: str,
         top_k: int = 5,
+        page: int = 1,
+        count: Optional[int] = None,
         context_chars: int = 60,
         product_name: Optional[str] = None,
         version: Optional[str] = None,
@@ -1027,9 +1015,27 @@ class Searcher:
         categories: Optional[List[str]] = None,
         search_type: str = "hybrid",
         sort_by: str = "score",
-    ) -> List[Dict[str, Any]]:
-        """Поиск по коллекциям для /search. Фильтры применяются только если переданы."""
+    ) -> Dict[str, Any]:
+        """Поиск по коллекциям для /search. Фильтры применяются только если переданы.
+
+        Во всех режимах у Weaviate запрашивается только текущая страница выдачи.
+        Для гибридного поиска по релевантности в неё попадают страницы с оценкой
+        реранкера выше порога. Сортировка newest/oldest делается в Weaviate
+        по полю updated_at.
+        """
         docs_start_time = time.perf_counter()
+        page = max(1, int(page))
+        page_size = count if count is not None else top_k
+        page_size = min(100, max(1, int(page_size)))
+        offset = (page - 1) * page_size
+
+        def catalog_page(results: List[Dict[str, Any]], total: int) -> Dict[str, Any]:
+            return {
+                "results": results,
+                "total": total,
+                "page": page,
+                "count": page_size,
+            }
         product_name = _clean_filter_value(product_name)
         version = _clean_filter_value(version)
         section = _clean_filter_value(section)
@@ -1053,13 +1059,12 @@ class Searcher:
         )
         exact = search_type == "exact"
         words = query_words(query) if exact else []
-        # Одно слово — like по подстроке. Несколько слов — BM25 AND.
         like_word = words[0] if len(words) == 1 and len(words[0]) >= 3 else ""
         self.logger.info(
             f"[req: {request_id}] Catalog search started: "
             f"collections={[name for name, _ in collections]}, "
             f"search_type={search_type}, sort_by={sort_by}, "
-            f"top_k={top_k}, context_chars={context_chars}, "
+            f"top_k={top_k}, page={page}, count={page_size}, context_chars={context_chars}, "
             f"product_name={product_name}, version={version}, section={section}, "
             f"tags={tags or None}, categories={categories or None}, "
             f"like_word={like_word or None}, words={words or None}"
@@ -1068,7 +1073,7 @@ class Searcher:
 
         if not collections or not query.strip():
             self.logger.warning(f"[req: {request_id}] Catalog search skipped: empty query or no collections")
-            return []
+            return catalog_page([], 0)
 
         return_properties = [
             "title",
@@ -1085,9 +1090,12 @@ class Searcher:
             "updated_at",
         ]
         by_date = sort_by in ("newest", "oldest")
+        hybrid_score = (not exact) and sort_by == "score"
+        fetch_pages = offset + page_size
+        fetch_limit = fetch_pages + CATALOG_GROUP_SLACK
         page_group = GroupBy(
             prop="page_url",
-            number_of_groups=top_k,
+            number_of_groups=fetch_pages,
             objects_per_group=1,
         )
         clauses = []
@@ -1098,8 +1106,6 @@ class Searcher:
                 Filter.by_property("page_content").like(f"*{like_word.casefold()}*")
             )
         if by_date:
-            # Сортировка по дате — это fetch, а не добор кандидатов.
-            # Слова запроса остаются фильтром, чтобы в выдачу не попал весь каталог.
             for word in query_words(query):
                 if len(word) >= 3 and word.casefold() != like_word.casefold():
                     clauses.append(
@@ -1112,39 +1118,62 @@ class Searcher:
         elif clauses:
             query_filter = Filter.all_of(clauses)
 
-        def fetch_by_date(collection):
-            """Сортировка по updated_at. group_by здесь нельзя: без BM25/hybrid Weaviate отвечает «group is not present»."""
-            return collection.query.fetch_objects(
-                filters=query_filter,
-                sort=Sort.by_property(name="updated_at", ascending=sort_by == "oldest"),
-                limit=top_k,
-                return_properties=return_properties,
-            )
+        def object_page(obj) -> str:
+            url = obj.properties.get("page_url") or obj.properties.get("source") or ""
+            return url.split("#")[0].rstrip("/")
 
-        def run_query(collection):
-            # GroupBy только вместе с настоящим поиском. Фильтр like и сортировка по дате — fetch_objects.
-            if by_date:
-                return fetch_by_date(collection)
-            if like_word:
-                return collection.query.fetch_objects(
+        def scan_objects(collection):
+            """fetch_objects не умеет group_by. Листаем объекты, пока не наберём уникальные страницы."""
+            found = []
+            seen = set()
+            object_offset = 0
+            batch = fetch_limit
+            sort = (
+                Sort.by_property(name="updated_at", ascending=sort_by == "oldest")
+                if by_date
+                else None
+            )
+            while len(found) < fetch_pages:
+                res = collection.query.fetch_objects(
                     filters=query_filter,
-                    limit=top_k,
+                    sort=sort,
+                    limit=batch,
+                    offset=object_offset,
                     return_properties=return_properties,
                 )
+                objects = list(res.objects or [])
+                if not objects:
+                    break
+                for obj in objects:
+                    key = object_page(obj)
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    found.append(obj)
+                    if len(found) >= fetch_pages:
+                        break
+                if len(objects) < batch:
+                    break
+                object_offset += len(objects)
+            return type("Scan", (), {"objects": found, "groups": None})()
+
+        def run_query(collection):
+            if by_date or like_word:
+                return scan_objects(collection)
             if exact:
                 return collection.query.bm25(
                     query=query,
                     operator=BM25Operator.and_(),
                     filters=query_filter,
                     group_by=page_group,
-                    limit=top_k,
+                    limit=fetch_limit,
                     return_metadata=MetadataQuery(score=True),
                     return_properties=return_properties,
                 )
             return collection.query.hybrid(
                 query=query,
                 alpha=0.2,
-                limit=top_k,
+                limit=fetch_limit,
                 filters=query_filter,
                 group_by=page_group,
                 return_metadata=MetadataQuery(score=True),
@@ -1198,18 +1227,25 @@ class Searcher:
                 for obj in objects
             ])
 
-        fused = self._fuse_rrf(ranked_lists)
+        fused = self._fuse_rrf(ranked_lists)[:fetch_pages]
         raw_docs = fused
         if not raw_docs:
             self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
-            return []
+            return catalog_page([], 0)
 
-        # Реранкер только для гибридного поиска по релевантности.
-        # exact — like или BM25 AND, порядок по дате задаёт updated_at уже по страницам.
-        use_rerank = (not exact) and sort_by == "score"
+        use_rerank = hybrid_score
         if use_rerank:
             scored_docs = await self.reranker.rerank.remote(
                 query, request_id, raw_docs, top_k=len(raw_docs), alpha=0.8
+            )
+            before_cutoff = len(scored_docs)
+            scored_docs = [
+                doc for doc in scored_docs
+                if float(doc.get("rerank_score_raw") or 0.0) > CATALOG_RERANK_MIN_SCORE
+            ]
+            self.logger.info(
+                f"[req: {request_id}] Catalog rerank cutoff > {CATALOG_RERANK_MIN_SCORE}: "
+                f"{before_cutoff} -> {len(scored_docs)}"
             )
         else:
             self.logger.info(
@@ -1221,21 +1257,20 @@ class Searcher:
                 doc["combined_score"] = float(
                     doc.get("rrf_score", doc.get("hybrid_score", 0.0))
                 )
-        # Для каталожного поиска одна страница — один результат: чанк с лучшим score.
-        # RAG по-прежнему может взять несколько чанков через _select_diverse.
         pages = []
         seen_pages = set()
         for doc in scored_docs:
-            page = (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
-            if not page or page in seen_pages:
+            page_key = (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
+            if not page_key or page_key in seen_pages:
                 continue
-            seen_pages.add(page)
+            seen_pages.add(page_key)
             pages.append(doc)
         pages = order_pages_by_date(pages, sort_by)
-        selected = pages[:top_k]
+        total = len(pages)
+        selected = pages[offset:offset + page_size]
         self.logger.info(
             f"[req: {request_id}] Grouped {len(scored_docs)} pages, "
-            f"sort_by={sort_by}, returning {len(selected)}"
+            f"sort_by={sort_by}, total={total}, page={page}, returning {len(selected)}"
         )
 
         documents = []
@@ -1267,7 +1302,7 @@ class Searcher:
                 f"section={doc['section']} url={doc['page_url']}"
             )
             self.logger.debug(f"[req: {request_id}] Hit #{rank} snippet: {short(doc['content'])}")
-        return documents
+        return catalog_page(documents, total)
 
     async def list_catalog(self, request_id: str) -> Dict[str, Any]:
         """Продукты с версиями, категории и теги по всем коллекциям /search."""
@@ -1979,7 +2014,8 @@ class SmartRouter:
         search_start = time.perf_counter()
         self.logger.info(
             f"[req: {request_id}] POST /search: search_type={req.search_type}, "
-            f"sort_by={req.sort_by}, top_k={req.top_k}, context_chars={req.context_chars}, "
+            f"sort_by={req.sort_by}, top_k={req.top_k}, page={req.page}, count={req.count}, "
+            f"context_chars={req.context_chars}, "
             f"product_name={req.product_name}, version={req.version}, "
             f"section={req.section}, tags={req.tags}, categories={req.categories}"
         )
@@ -1989,10 +2025,12 @@ class SmartRouter:
             self.logger.info(f"[req: {request_id}] /search rejected: {short_query}")
             raise HTTPException(status_code=400, detail=short_query)
 
-        docs = await self.searcher.search_documents.remote(
+        found = await self.searcher.search_documents.remote(
             query=req.query,
             request_id=request_id,
             top_k=req.top_k,
+            page=req.page,
+            count=req.count,
             context_chars=req.context_chars,
             product_name=req.product_name,
             version=req.version,
@@ -2003,12 +2041,15 @@ class SmartRouter:
             sort_by=req.sort_by,
         )
         self.logger.info(
-            f"[req: {request_id}] /search returned {len(docs)} docs "
+            f"[req: {request_id}] /search returned {len(found['results'])} of {found['total']} docs "
             f"in {time.perf_counter() - search_start:.3f}s"
         )
 
         return SearchResponse(
-            results=[SearchResultDocument(**doc) for doc in docs]
+            results=[SearchResultDocument(**doc) for doc in found["results"]],
+            total=found["total"],
+            page=found["page"],
+            count=found["count"],
         )
 
     @app.get("/products", response_model=ProductsResponse)
