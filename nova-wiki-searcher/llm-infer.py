@@ -90,15 +90,32 @@ def _version_sort_key(version: str):
     return parts
 
 
-def build_catalog(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Уникальные продукты с версиями, категории и теги по чанкам индекса.
+def _catalog_record(
+    slug: str,
+    name: str,
+    versions: set,
+    sections: set,
+) -> Dict[str, Any]:
+    return {
+        "product": slug,
+        "product_name": name,
+        "versions": sorted(versions, key=_version_sort_key),
+        "sections": sorted(sections),
+    }
 
-    Пустые строки не попадают в списки. Версии без product_name
-    присоединяются к единственному имени этого slug.
+
+def build_catalog(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Уникальные продукты с версиями, разделами, категориями и тегами.
+
+    Если имя из меты базы знаний совпадает с именем документации, в каталоге
+    остаётся один пункт. Версии берутся только из документации, разделы —
+    из обоих корпусов. targets говорит поиску, какие коллекции открывать.
     """
     named_versions: Dict[tuple, set] = {}
     unnamed_versions: Dict[str, set] = {}
     name_counts: Dict[str, Dict[str, int]] = {}
+    named_sections: Dict[tuple, set] = {}
+    unnamed_sections: Dict[str, set] = {}
     categories = set()
     tags = set()
 
@@ -108,47 +125,107 @@ def build_catalog(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         name = str(row.get("product_name") or "").strip()
         version = str(row.get("version") or "").strip()
+        section = str(row.get("section") or "").strip()
         if name:
             counts = name_counts.setdefault(slug, {})
             counts[name] = counts.get(name, 0) + 1
             bucket = named_versions.setdefault((slug, name), set())
             if version:
                 bucket.add(version)
-        elif version:
-            unnamed_versions.setdefault(slug, set()).add(version)
+            if section:
+                named_sections.setdefault((slug, name), set()).add(section)
+        else:
+            if version:
+                unnamed_versions.setdefault(slug, set()).add(version)
+            if section:
+                unnamed_sections.setdefault(slug, set()).add(section)
         categories.update(_as_str_list(row.get("categories")))
         tags.update(_as_str_list(row.get("tags")))
 
-    products = []
-    for slug in sorted(set(name_counts) | set(unnamed_versions)):
+    raw = []
+    for slug in sorted(set(name_counts) | set(unnamed_versions) | set(unnamed_sections)):
         names = name_counts.get(slug, {})
         if len(names) == 1:
             name = next(iter(names))
             versions = set(named_versions.get((slug, name), ()))
             versions.update(unnamed_versions.get(slug, ()))
-            products.append({
-                "product": slug,
-                "product_name": name,
-                "versions": sorted(versions, key=_version_sort_key),
-            })
+            sections = set(named_sections.get((slug, name), ()))
+            sections.update(unnamed_sections.get(slug, ()))
+            raw.append(_catalog_record(slug, name, versions, sections))
         elif not names:
-            products.append({
-                "product": slug,
-                "product_name": "",
-                "versions": sorted(unnamed_versions.get(slug, ()), key=_version_sort_key),
-            })
+            raw.append(_catalog_record(
+                slug,
+                "",
+                set(unnamed_versions.get(slug, ())),
+                set(unnamed_sections.get(slug, ())),
+            ))
         else:
             for name, _count in sorted(names.items(), key=lambda item: (-item[1], item[0])):
-                products.append({
-                    "product": slug,
-                    "product_name": name,
-                    "versions": sorted(named_versions.get((slug, name), ()), key=_version_sort_key),
-                })
+                raw.append(_catalog_record(
+                    slug,
+                    name,
+                    set(named_versions.get((slug, name), ())),
+                    set(named_sections.get((slug, name), ())),
+                ))
 
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for item in raw:
+        groups.setdefault(item["product_name"].casefold(), []).append(item)
+
+    products = []
+    # Ключ — casefold имени или slug. Значение — (slug, точное имя меты или None).
+    # None значит всю коллекцию. Имя нужно базе знаний, чтобы не захватить страницы без меты.
+    targets: Dict[str, List[tuple]] = {}
+
+    def add_target(key: str, slug: str, name: Optional[str]) -> None:
+        if not key:
+            return
+        bucket = targets.setdefault(key, [])
+        pair = (slug, name)
+        if pair not in bucket:
+            bucket.append(pair)
+
+    for item in raw:
+        add_target(item["product"].casefold(), item["product"], None)
+
+    for key, group in groups.items():
+        if not key:
+            products.extend(group)
+            continue
+        docs = [item for item in group if item["product"] != "kb"]
+        kb_items = [item for item in group if item["product"] == "kb"]
+        if docs and kb_items:
+            primary = next(
+                (item for item in docs if item["product"].casefold() == key),
+                docs[0],
+            )
+            versions = set()
+            sections = set()
+            for item in docs:
+                versions.update(item["versions"])
+            for item in docs + kb_items:
+                sections.update(item["sections"])
+            products.append(_catalog_record(
+                primary["product"],
+                primary["product_name"],
+                versions,
+                sections,
+            ))
+            for item in docs:
+                add_target(key, item["product"], None)
+                add_target(item["product"].casefold(), "kb", primary["product_name"])
+            add_target(key, "kb", primary["product_name"])
+        else:
+            products.extend(group)
+            for item in group:
+                add_target(key, item["product"], None)
+
+    products.sort(key=lambda item: item["product"])
     return {
         "products": products,
         "categories": sorted(categories),
         "tags": sorted(tags),
+        "targets": targets,
     }
 
 
@@ -541,6 +618,7 @@ class ProductInfo(BaseModel):
     product: str
     product_name: str
     versions: List[str]
+    sections: List[str] = []
 
 class ProductsResponse(BaseModel):
     products: List[ProductInfo]
@@ -704,6 +782,7 @@ class Searcher:
             raise RuntimeError("Weaviate is not ready, aborting Searcher initialization")
         
         self.product_collections = self._discover_collections()
+        self._catalog_cache = None
         known = sorted(self.product_collections)
         self.default_product = DEFAULT_PRODUCT if DEFAULT_PRODUCT in self.product_collections else (known[0] if known else "")
         if not self.product_collections:
@@ -745,6 +824,28 @@ class Searcher:
             slug: self.weaviate_connection.collections.use(alias)
             for slug, alias in sorted(found.items())
         }
+
+    def _facet_rows(self) -> List[Dict[str, Any]]:
+        rows = []
+        properties = ["product", "product_name", "version", "section", "tags", "categories"]
+        for slug, collection in self.product_collections.items():
+            try:
+                for obj in collection.iterator(
+                    include_vector=False,
+                    return_properties=properties,
+                ):
+                    props = dict(obj.properties or {})
+                    if not str(props.get("product") or "").strip():
+                        props["product"] = slug
+                    rows.append(props)
+            except Exception as exc:
+                self.logger.warning(f"Facet scan failed for product '{slug}': {exc}")
+        return rows
+
+    def _catalog(self, refresh: bool = False) -> Dict[str, Any]:
+        if refresh or self._catalog_cache is None:
+            self._catalog_cache = build_catalog(self._facet_rows())
+        return self._catalog_cache
 
     async def _fetch_docs_parallel(self, query_text: str, product_name: str, product_version: str, request_id: str) -> List[List[Dict[str, Any]]]:
         """Возвращает ранжированные списки по коллекциям — отдельно, для RRF."""
@@ -1042,16 +1143,30 @@ class Searcher:
         tags = _as_str_list(tags)
         categories = _as_str_list(categories)
 
-        collections = list(self.product_collections.items())
+        # (slug, collection, точное имя меты или None, legacy-строка для неизвестного продукта)
+        # None в имени меты — вся коллекция. Legacy нужен, пока каталог не знает это имя.
+        jobs = []
         if product_name:
-            slug_match = [
-                item for item in collections if item[0].lower() == product_name.lower()
+            catalog = await asyncio.to_thread(self._catalog)
+            planned = catalog.get("targets", {}).get(product_name.casefold())
+            if planned:
+                for slug, meta_name in planned:
+                    collection = self.product_collections.get(slug)
+                    if collection is not None:
+                        jobs.append((slug, collection, meta_name, None))
+            else:
+                jobs = [
+                    (slug, collection, None, product_name)
+                    for slug, collection in self.product_collections.items()
+                ]
+        else:
+            jobs = [
+                (slug, collection, None, None)
+                for slug, collection in self.product_collections.items()
             ]
-            if slug_match:
-                collections = slug_match
+        collections = [(slug, collection) for slug, collection, _meta, _legacy in jobs]
 
-        weaviate_filter = catalog_filter(
-            product_name=product_name,
+        shared_filter = catalog_filter(
             version=version,
             section=section,
             tags=tags,
@@ -1099,8 +1214,8 @@ class Searcher:
             objects_per_group=1,
         )
         clauses = []
-        if weaviate_filter is not None:
-            clauses.append(weaviate_filter)
+        if shared_filter is not None:
+            clauses.append(shared_filter)
         if like_word:
             clauses.append(
                 Filter.by_property("page_content").like(f"*{like_word.casefold()}*")
@@ -1112,17 +1227,29 @@ class Searcher:
                         Filter.by_property("page_content").like(f"*{word.casefold()}*")
                     )
             clauses.append(Filter.by_property("updated_at").is_none(False))
-        query_filter = None
-        if len(clauses) == 1:
-            query_filter = clauses[0]
-        elif clauses:
-            query_filter = Filter.all_of(clauses)
+        def with_product(meta_name: Optional[str], legacy: Optional[str]):
+            extra = None
+            if legacy:
+                extra = Filter.any_of([
+                    Filter.by_property("product_name").equal(legacy),
+                    Filter.by_property("product").equal(legacy),
+                ])
+            elif meta_name:
+                extra = Filter.by_property("product_name").equal(meta_name)
+            parts = list(clauses)
+            if extra is not None:
+                parts.append(extra)
+            if not parts:
+                return None
+            if len(parts) == 1:
+                return parts[0]
+            return Filter.all_of(parts)
 
         def object_page(obj) -> str:
             url = obj.properties.get("page_url") or obj.properties.get("source") or ""
             return url.split("#")[0].rstrip("/")
 
-        def scan_objects(collection):
+        def scan_objects(collection, query_filter):
             """fetch_objects не умеет group_by. Листаем объекты, пока не наберём уникальные страницы."""
             found = []
             seen = set()
@@ -1157,9 +1284,9 @@ class Searcher:
                 object_offset += len(objects)
             return type("Scan", (), {"objects": found, "groups": None})()
 
-        def run_query(collection):
+        def run_query(collection, query_filter):
             if by_date or like_word:
-                return scan_objects(collection)
+                return scan_objects(collection, query_filter)
             if exact:
                 return collection.query.bm25(
                     query=query,
@@ -1191,8 +1318,8 @@ class Searcher:
             return list(res.objects or [])
 
         pending = [
-            (product, asyncio.to_thread(run_query, collection))
-            for product, collection in collections
+            (slug, asyncio.to_thread(run_query, collection, with_product(meta_name, legacy)))
+            for slug, collection, meta_name, legacy in jobs
         ]
         fetch_start = time.perf_counter()
         results = await asyncio.gather(*(task for _, task in pending))
@@ -1325,32 +1452,12 @@ class Searcher:
             f"collections={list(self.product_collections)}"
         )
 
-        def scan() -> List[Dict[str, Any]]:
-            rows = []
-            properties = ["product", "product_name", "version", "tags", "categories"]
-            for slug, collection in self.product_collections.items():
-                try:
-                    for obj in collection.iterator(
-                        include_vector=False,
-                        return_properties=properties,
-                    ):
-                        props = dict(obj.properties or {})
-                        if not str(props.get("product") or "").strip():
-                            props["product"] = slug
-                        rows.append(props)
-                except Exception as exc:
-                    self.logger.warning(
-                        f"[req: {request_id}] Facet scan failed for product '{slug}': {exc}"
-                    )
-            return rows
-
-        rows = await asyncio.to_thread(scan)
-        catalog = build_catalog(rows)
+        catalog = await asyncio.to_thread(self._catalog, True)
         self.logger.info(
             f"[req: {request_id}] Catalog facets: "
             f"{len(catalog['products'])} products, "
             f"{len(catalog['categories'])} categories, "
-            f"{len(catalog['tags'])} tags from {len(rows)} chunks "
+            f"{len(catalog['tags'])} tags "
             f"in {time.perf_counter() - started:.3f}s"
         )
         return catalog
