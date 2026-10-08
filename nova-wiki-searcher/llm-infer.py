@@ -43,10 +43,10 @@ DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
 # съедают лимит. Небольшой запас объектов нужен, чтобы после склейки осталось
 # запрошенное число страниц.
 CATALOG_GROUP_SLACK = 10
-# Сырая оценка bge-reranker-v2-m3. Выше 0 модель считает страницу релевантной
-# (вероятность больше 0.5). Нормированный combined_score для порога не годится:
-# внутри пачки лучшая страница всегда получает 1, даже если запрос ни о чём.
-CATALOG_RERANK_MIN_SCORE = float(os.getenv("CATALOG_RERANK_MIN_SCORE", "0"))
+# Итоговый score: 0.8 нормированного реранкера и 0.2 предварительного ранга, от 0 до 1
+# внутри текущей страницы. Хвост ниже 0.2 не отдаём. Сырой логит реранкера для
+# отсечения не используем: у подходящих страниц он тоже бывает отрицательным.
+CATALOG_SCORE_MIN = float(os.getenv("CATALOG_SCORE_MIN", "0.2"))
 
 LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
 
@@ -1227,49 +1227,62 @@ class Searcher:
                 for obj in objects
             ])
 
-        fused = self._fuse_rrf(ranked_lists)[:fetch_pages]
-        raw_docs = fused
-        if not raw_docs:
+        def page_key_of(doc: Dict[str, Any]) -> str:
+            return (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
+
+        def unique_pages(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            found = []
+            seen = set()
+            for doc in docs:
+                key = page_key_of(doc)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                found.append(doc)
+                if len(found) >= fetch_pages:
+                    break
+            return found
+
+        if by_date:
+            # Сортировка по дате до нарезки. RRF здесь меняет состав окна,
+            # и вторая страница перестаёт быть продолжением первой.
+            ordered = order_pages_by_date(
+                [doc for ranked in ranked_lists for doc in ranked],
+                sort_by,
+            )
+        else:
+            ordered = self._fuse_rrf(ranked_lists)
+        pages = unique_pages(ordered)
+        if not pages:
             self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
             return catalog_page([], 0)
 
-        use_rerank = hybrid_score
-        if use_rerank:
-            scored_docs = await self.reranker.rerank.remote(
-                query, request_id, raw_docs, top_k=len(raw_docs), alpha=0.8
+        total = len(pages)
+        selected = list(pages[offset:offset + page_size])
+        if hybrid_score and selected:
+            selected = await self.reranker.rerank.remote(
+                query, request_id, selected, top_k=len(selected), alpha=0.8
             )
-            before_cutoff = len(scored_docs)
-            scored_docs = [
-                doc for doc in scored_docs
-                if float(doc.get("rerank_score_raw") or 0.0) > CATALOG_RERANK_MIN_SCORE
+            before_cutoff = len(selected)
+            selected = [
+                doc for doc in selected
+                if float(doc.get("combined_score") or 0.0) > CATALOG_SCORE_MIN
             ]
             self.logger.info(
-                f"[req: {request_id}] Catalog rerank cutoff > {CATALOG_RERANK_MIN_SCORE}: "
-                f"{before_cutoff} -> {len(scored_docs)}"
+                f"[req: {request_id}] Catalog score cutoff > {CATALOG_SCORE_MIN}: "
+                f"{before_cutoff} -> {len(selected)}"
             )
         else:
             self.logger.info(
                 f"[req: {request_id}] Catalog rerank skipped: "
                 f"search_type={search_type}, sort_by={sort_by}"
             )
-            scored_docs = raw_docs
-            for doc in scored_docs:
+            for doc in selected:
                 doc["combined_score"] = float(
                     doc.get("rrf_score", doc.get("hybrid_score", 0.0))
                 )
-        pages = []
-        seen_pages = set()
-        for doc in scored_docs:
-            page_key = (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
-            if not page_key or page_key in seen_pages:
-                continue
-            seen_pages.add(page_key)
-            pages.append(doc)
-        pages = order_pages_by_date(pages, sort_by)
-        total = len(pages)
-        selected = pages[offset:offset + page_size]
         self.logger.info(
-            f"[req: {request_id}] Grouped {len(scored_docs)} pages, "
+            f"[req: {request_id}] Grouped {len(pages)} pages, "
             f"sort_by={sort_by}, total={total}, page={page}, returning {len(selected)}"
         )
 
