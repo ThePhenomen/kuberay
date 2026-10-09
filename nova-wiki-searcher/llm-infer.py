@@ -468,7 +468,13 @@ HYDE_MAX_TOKENS = int(os.getenv("HYDE_MAX_TOKENS", "96"))
 
 RERANK_MAX_LENGTH = int(os.getenv("RERANK_MAX_LENGTH", "2048"))
 RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "6000"))
-RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "16"))
+RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "32"))
+# Каталог оценивает до 200 страниц. В модель идут заголовок и 1000 символов текста.
+CATALOG_RERANK_CHARS = int(os.getenv("CATALOG_RERANK_CHARS", "1000"))
+CATALOG_RERANK_MAX_LENGTH = int(os.getenv("CATALOG_RERANK_MAX_LENGTH", "512"))
+# Повтор того же запроса с другими page/count берёт уже посчитанный список.
+CATALOG_RESULT_CACHE_TTL = float(os.getenv("CATALOG_RESULT_CACHE_TTL", "120"))
+CATALOG_RESULT_CACHE_SIZE = int(os.getenv("CATALOG_RESULT_CACHE_SIZE", "64"))
 
 RRF_K = int(os.getenv("RRF_K", "60"))
 SEARCH_PER_PAGE_CAP = int(os.getenv("SEARCH_PER_PAGE_CAP", "2"))
@@ -703,7 +709,7 @@ class Reranker:
         )
         self.model.eval()
 
-    def _score_pairs(self, pairs: List[List[str]]) -> List[float]:
+    def _score_pairs(self, pairs: List[List[str]], max_length: int) -> List[float]:
         """Скорит пары батчами, сортируя по длине, чтобы не раздувать padding."""
         device = next(self.model.parameters()).device
         order = sorted(range(len(pairs)), key=lambda i: len(pairs[i][1]))
@@ -716,7 +722,7 @@ class Reranker:
                     [pairs[i] for i in batch_idx],
                     padding=True,
                     truncation=True,
-                    max_length=RERANK_MAX_LENGTH,
+                    max_length=max_length,
                     return_tensors="pt",
                 ).to(device)
 
@@ -735,7 +741,8 @@ class Reranker:
         docs: List[Dict[str, str]],
         top_k: int = 8,
         alpha: float = 0.8,
-
+        max_chars: Optional[int] = None,
+        max_length: Optional[int] = None,
     ) -> List[Dict[str, str]]:
         if not docs:
             self.logger.info(f"[req: {request_id}] Rerank skipped: no documents")
@@ -748,19 +755,24 @@ class Reranker:
         )
         self.logger.debug(f"[req: {request_id}] Rerank query: {short(query)}")
 
+        char_limit = RERANK_MAX_CHARS if max_chars is None else max_chars
+        token_limit = RERANK_MAX_LENGTH if max_length is None else max_length
         pairs = []
         for doc in docs:
-            title = doc.get("title", "")
-            content = doc.get("page_content", "")
-            snippet = f"{title}\n{content}"[:RERANK_MAX_CHARS]
+            title = doc.get("title", "") or ""
+            content = doc.get("page_content", "") or ""
+            if max_chars is None:
+                snippet = f"{title}\n{content}"[:char_limit]
+            else:
+                snippet = f"{title}\n{content[:char_limit]}"
             pairs.append([query, snippet])
 
         score_start = time.perf_counter()
-        rerank_scores = self._score_pairs(pairs)
+        rerank_scores = self._score_pairs(pairs, token_limit)
         batches = math.ceil(len(pairs) / RERANK_BATCH_SIZE)
         self.logger.debug(
             f"[req: {request_id}] Scored {len(pairs)} pairs in {batches} batch(es) "
-            f"(batch_size={RERANK_BATCH_SIZE}, max_length={RERANK_MAX_LENGTH}) "
+            f"(batch_size={RERANK_BATCH_SIZE}, max_length={token_limit}) "
             f"in {time.perf_counter() - score_start:.3f}s"
         )
 
@@ -838,6 +850,7 @@ class Searcher:
         
         self.product_collections = self._discover_collections()
         self._catalog_cache = None
+        self._result_cache: Dict[str, Any] = {}
         known = sorted(self.product_collections)
         self.default_product = DEFAULT_PRODUCT if DEFAULT_PRODUCT in self.product_collections else (known[0] if known else "")
         if not self.product_collections:
@@ -1156,6 +1169,51 @@ class Searcher:
 
         return merged
 
+    def _catalog_result_key(
+        self,
+        query: str,
+        product_name: Optional[str],
+        version: Optional[str],
+        section: List[str],
+        tags: List[str],
+        categories: List[str],
+        search_type: str,
+        sort_by: str,
+    ) -> str:
+        """Ключ без page и count: вторая страница берёт тот же список."""
+        payload = {
+            "query": query.strip(),
+            "product_name": product_name or "",
+            "version": version or "",
+            "section": section,
+            "tags": tags,
+            "categories": categories,
+            "search_type": search_type,
+            "sort_by": sort_by,
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _catalog_result_get(self, key: str) -> Optional[List[Dict[str, Any]]]:
+        now = time.monotonic()
+        item = self._result_cache.get(key)
+        if item is None:
+            return None
+        expires, pages = item
+        if expires <= now:
+            self._result_cache.pop(key, None)
+            return None
+        return pages
+
+    def _catalog_result_put(self, key: str, pages: List[Dict[str, Any]]) -> None:
+        now = time.monotonic()
+        stale = [name for name, (expires, _) in self._result_cache.items() if expires <= now]
+        for name in stale:
+            self._result_cache.pop(name, None)
+        self._result_cache.pop(key, None)
+        while len(self._result_cache) >= CATALOG_RESULT_CACHE_SIZE:
+            self._result_cache.pop(next(iter(self._result_cache)))
+        self._result_cache[key] = (now + CATALOG_RESULT_CACHE_TTL, pages)
+
     async def search_documents(
         self,
         query: str,
@@ -1179,6 +1237,8 @@ class Searcher:
         в список входят только страницы с итоговым score выше порога.
         Сортировка newest/oldest делается в Weaviate по полю updated_at.
         Размер страницы задаёт count. top_k на выдачу не влияет.
+        Одинаковый запрос и фильтры две минуты отдают уже посчитанный список,
+        поэтому следующая страница не ходит в Weaviate и реранкер.
         """
         docs_start_time = time.perf_counter()
         page = max(1, int(page))
@@ -1199,271 +1259,285 @@ class Searcher:
         tags = _as_str_list(tags)
         categories = _as_str_list(categories)
 
-        # (slug, collection, точное имя меты или None, legacy-строка для неизвестного продукта)
-        # None в имени меты — вся коллекция. Legacy нужен, пока каталог не знает это имя.
-        jobs = []
-        if product_name:
-            catalog = await asyncio.to_thread(self._catalog)
-            planned = catalog.get("targets", {}).get(product_name.casefold())
-            if planned:
-                for slug, meta_name in planned:
-                    collection = self.product_collections.get(slug)
-                    if collection is not None:
-                        jobs.append((slug, collection, meta_name, None))
+        cache_key = self._catalog_result_key(
+            query, product_name, version, section, tags, categories, search_type, sort_by,
+        )
+        pages = self._catalog_result_get(cache_key)
+        if pages is not None:
+            self.logger.info(
+                f"[req: {request_id}] Catalog result cache hit: {len(pages)} pages"
+            )
+        else:
+            # (slug, collection, точное имя меты или None, legacy-строка для неизвестного продукта)
+            # None в имени меты — вся коллекция. Legacy нужен, пока каталог не знает это имя.
+            jobs = []
+            if product_name:
+                catalog = await asyncio.to_thread(self._catalog)
+                planned = catalog.get("targets", {}).get(product_name.casefold())
+                if planned:
+                    for slug, meta_name in planned:
+                        collection = self.product_collections.get(slug)
+                        if collection is not None:
+                            jobs.append((slug, collection, meta_name, None))
+                else:
+                    jobs = [
+                        (slug, collection, None, product_name)
+                        for slug, collection in self.product_collections.items()
+                    ]
             else:
                 jobs = [
-                    (slug, collection, None, product_name)
+                    (slug, collection, None, None)
                     for slug, collection in self.product_collections.items()
                 ]
-        else:
-            jobs = [
-                (slug, collection, None, None)
-                for slug, collection in self.product_collections.items()
+            collections = [(slug, collection) for slug, collection, _meta, _legacy in jobs]
+
+            shared_filter = catalog_filter(
+                version=version,
+                section=section,
+                tags=tags,
+                categories=categories,
+            )
+            exact = search_type == "exact"
+            words = query_words(query) if exact else []
+            like_word = words[0] if len(words) == 1 and len(words[0]) >= 3 else ""
+            self.logger.info(
+                f"[req: {request_id}] Catalog search started: "
+                f"collections={[name for name, _ in collections]}, "
+                f"search_type={search_type}, sort_by={sort_by}, "
+                f"top_k={top_k}, page={page}, count={page_size}, context_chars={context_chars}, "
+                f"product_name={product_name}, version={version}, section={section}, "
+                f"tags={tags or None}, categories={categories or None}, "
+                f"like_word={like_word or None}, words={words or None}"
+            )
+            self.logger.debug(f"[req: {request_id}] Catalog query: {short(query)}")
+
+            if not collections or not query.strip():
+                self.logger.warning(f"[req: {request_id}] Catalog search skipped: empty query or no collections")
+                self._catalog_result_put(cache_key, [])
+                return catalog_page([], 0)
+
+            return_properties = [
+                "title",
+                "page_content",
+                "page_url",
+                "source",
+                "product",
+                "product_name",
+                "version",
+                "section",
+                "tags",
+                "categories",
+                "published_at",
+                "updated_at",
             ]
-        collections = [(slug, collection) for slug, collection, _meta, _legacy in jobs]
-
-        shared_filter = catalog_filter(
-            version=version,
-            section=section,
-            tags=tags,
-            categories=categories,
-        )
-        exact = search_type == "exact"
-        words = query_words(query) if exact else []
-        like_word = words[0] if len(words) == 1 and len(words[0]) >= 3 else ""
-        self.logger.info(
-            f"[req: {request_id}] Catalog search started: "
-            f"collections={[name for name, _ in collections]}, "
-            f"search_type={search_type}, sort_by={sort_by}, "
-            f"top_k={top_k}, page={page}, count={page_size}, context_chars={context_chars}, "
-            f"product_name={product_name}, version={version}, section={section}, "
-            f"tags={tags or None}, categories={categories or None}, "
-            f"like_word={like_word or None}, words={words or None}"
-        )
-        self.logger.debug(f"[req: {request_id}] Catalog query: {short(query)}")
-
-        if not collections or not query.strip():
-            self.logger.warning(f"[req: {request_id}] Catalog search skipped: empty query or no collections")
-            return catalog_page([], 0)
-
-        return_properties = [
-            "title",
-            "page_content",
-            "page_url",
-            "source",
-            "product",
-            "product_name",
-            "version",
-            "section",
-            "tags",
-            "categories",
-            "published_at",
-            "updated_at",
-        ]
-        by_date = sort_by in ("newest", "oldest")
-        hybrid_score = (not exact) and sort_by == "score"
-        # Один и тот же набор для любой страницы: total не зависит от page и count.
-        # limit больше числа групп, потому что Weaviate режет объекты до склейки чанков.
-        fetch_pages = CATALOG_RANK_PAGES
-        fetch_limit = CATALOG_RANK_PAGES * 3 + CATALOG_GROUP_SLACK
-        page_group = GroupBy(
-            prop="page_url",
-            number_of_groups=fetch_pages,
-            objects_per_group=1,
-        )
-        clauses = []
-        if shared_filter is not None:
-            clauses.append(shared_filter)
-        if like_word:
-            clauses.append(
-                Filter.by_property("page_content").like(f"*{like_word.casefold()}*")
+            by_date = sort_by in ("newest", "oldest")
+            hybrid_score = (not exact) and sort_by == "score"
+            # Один и тот же набор для любой страницы: total не зависит от page и count.
+            # limit больше числа групп, потому что Weaviate режет объекты до склейки чанков.
+            fetch_pages = CATALOG_RANK_PAGES
+            fetch_limit = CATALOG_RANK_PAGES * 3 + CATALOG_GROUP_SLACK
+            page_group = GroupBy(
+                prop="page_url",
+                number_of_groups=fetch_pages,
+                objects_per_group=1,
             )
-        if by_date:
-            for word in query_words(query):
-                if len(word) >= 3 and word.casefold() != like_word.casefold():
-                    clauses.append(
-                        Filter.by_property("page_content").like(f"*{word.casefold()}*")
-                    )
-            clauses.append(Filter.by_property("updated_at").is_none(False))
-        def with_product(meta_name: Optional[str], legacy: Optional[str]):
-            extra = None
-            if legacy:
-                extra = Filter.any_of([
-                    Filter.by_property("product_name").equal(legacy),
-                    Filter.by_property("product").equal(legacy),
-                ])
-            elif meta_name:
-                extra = Filter.by_property("product_name").equal(meta_name)
-            parts = list(clauses)
-            if extra is not None:
-                parts.append(extra)
-            if not parts:
-                return None
-            if len(parts) == 1:
-                return parts[0]
-            return Filter.all_of(parts)
-
-        def object_page(obj) -> str:
-            url = obj.properties.get("page_url") or obj.properties.get("source") or ""
-            return url.split("#")[0].rstrip("/")
-
-        def scan_objects(collection, query_filter):
-            """fetch_objects не умеет group_by. Листаем объекты, пока не наберём уникальные страницы."""
-            found = []
-            seen = set()
-            object_offset = 0
-            batch = fetch_limit
-            sort = (
-                Sort.by_property(name="updated_at", ascending=sort_by == "oldest")
-                if by_date
-                else None
-            )
-            while len(found) < fetch_pages:
-                res = collection.query.fetch_objects(
-                    filters=query_filter,
-                    sort=sort,
-                    limit=batch,
-                    offset=object_offset,
-                    return_properties=return_properties,
+            clauses = []
+            if shared_filter is not None:
+                clauses.append(shared_filter)
+            if like_word:
+                clauses.append(
+                    Filter.by_property("page_content").like(f"*{like_word.casefold()}*")
                 )
-                objects = list(res.objects or [])
-                if not objects:
-                    break
-                for obj in objects:
-                    key = object_page(obj)
-                    if not key or key in seen:
-                        continue
-                    seen.add(key)
-                    found.append(obj)
-                    if len(found) >= fetch_pages:
-                        break
-                if len(objects) < batch:
-                    break
-                object_offset += len(objects)
-            return type("Scan", (), {"objects": found, "groups": None})()
+            if by_date:
+                for word in query_words(query):
+                    if len(word) >= 3 and word.casefold() != like_word.casefold():
+                        clauses.append(
+                            Filter.by_property("page_content").like(f"*{word.casefold()}*")
+                        )
+                clauses.append(Filter.by_property("updated_at").is_none(False))
+            def with_product(meta_name: Optional[str], legacy: Optional[str]):
+                extra = None
+                if legacy:
+                    extra = Filter.any_of([
+                        Filter.by_property("product_name").equal(legacy),
+                        Filter.by_property("product").equal(legacy),
+                    ])
+                elif meta_name:
+                    extra = Filter.by_property("product_name").equal(meta_name)
+                parts = list(clauses)
+                if extra is not None:
+                    parts.append(extra)
+                if not parts:
+                    return None
+                if len(parts) == 1:
+                    return parts[0]
+                return Filter.all_of(parts)
 
-        def run_query(collection, query_filter):
-            if by_date or like_word:
-                return scan_objects(collection, query_filter)
-            if exact:
-                return collection.query.bm25(
+            def object_page(obj) -> str:
+                url = obj.properties.get("page_url") or obj.properties.get("source") or ""
+                return url.split("#")[0].rstrip("/")
+
+            def scan_objects(collection, query_filter):
+                """fetch_objects не умеет group_by. Листаем объекты, пока не наберём уникальные страницы."""
+                found = []
+                seen = set()
+                object_offset = 0
+                batch = fetch_limit
+                sort = (
+                    Sort.by_property(name="updated_at", ascending=sort_by == "oldest")
+                    if by_date
+                    else None
+                )
+                while len(found) < fetch_pages:
+                    res = collection.query.fetch_objects(
+                        filters=query_filter,
+                        sort=sort,
+                        limit=batch,
+                        offset=object_offset,
+                        return_properties=return_properties,
+                    )
+                    objects = list(res.objects or [])
+                    if not objects:
+                        break
+                    for obj in objects:
+                        key = object_page(obj)
+                        if not key or key in seen:
+                            continue
+                        seen.add(key)
+                        found.append(obj)
+                        if len(found) >= fetch_pages:
+                            break
+                    if len(objects) < batch:
+                        break
+                    object_offset += len(objects)
+                return type("Scan", (), {"objects": found, "groups": None})()
+
+            def run_query(collection, query_filter):
+                if by_date or like_word:
+                    return scan_objects(collection, query_filter)
+                if exact:
+                    return collection.query.bm25(
+                        query=query,
+                        operator=BM25Operator.and_(),
+                        filters=query_filter,
+                        group_by=page_group,
+                        limit=fetch_limit,
+                        return_metadata=MetadataQuery(score=True),
+                        return_properties=return_properties,
+                    )
+                return collection.query.hybrid(
                     query=query,
-                    operator=BM25Operator.and_(),
+                    alpha=0.2,
+                    limit=fetch_limit,
                     filters=query_filter,
                     group_by=page_group,
-                    limit=fetch_limit,
                     return_metadata=MetadataQuery(score=True),
                     return_properties=return_properties,
                 )
-            return collection.query.hybrid(
-                query=query,
-                alpha=0.2,
-                limit=fetch_limit,
-                filters=query_filter,
-                group_by=page_group,
-                return_metadata=MetadataQuery(score=True),
-                return_properties=return_properties,
-            )
 
-        def grouped_objects(res):
-            groups = getattr(res, "groups", None) or {}
-            if groups:
-                found = []
-                for group in groups.values():
-                    if group.objects:
-                        found.append(group.objects[0])
-                return found
-            return list(res.objects or [])
+            def grouped_objects(res):
+                groups = getattr(res, "groups", None) or {}
+                if groups:
+                    found = []
+                    for group in groups.values():
+                        if group.objects:
+                            found.append(group.objects[0])
+                    return found
+                return list(res.objects or [])
 
-        pending = [
-            (slug, asyncio.to_thread(run_query, collection, with_product(meta_name, legacy)))
-            for slug, collection, meta_name, legacy in jobs
-        ]
-        fetch_start = time.perf_counter()
-        results = await asyncio.gather(*(task for _, task in pending))
-        grouped = [(name, grouped_objects(res)) for (name, _), res in zip(pending, results)]
-        self.logger.info(
-            f"[req: {request_id}] Catalog search in {time.perf_counter() - fetch_start:.3f}s: "
-            + ", ".join(f"{name} - {len(objects)} pages" for name, objects in grouped)
-        )
-
-        ranked_lists = []
-        for product, objects in grouped:
-            ranked_lists.append([
-                {
-                    "title": obj.properties.get("title", "") or "",
-                    "page_content": obj.properties.get("page_content", "") or "",
-                    "page_url": obj.properties.get("page_url", "") or "",
-                    "source": obj.properties.get("source", "") or "",
-                    "product": obj.properties.get("product", "") or product,
-                    "product_name": obj.properties.get("product_name", "") or "",
-                    "version": obj.properties.get("version", "") or "",
-                    "section": obj.properties.get("section", "") or "",
-                    "tags": _as_str_list(obj.properties.get("tags")),
-                    "categories": _as_str_list(obj.properties.get("categories")),
-                    "published_at": normalize_article_time(obj.properties.get("published_at")),
-                    "updated_at": normalize_article_time(obj.properties.get("updated_at")),
-                    "hybrid_score": float(
-                        getattr(obj.metadata, "score", None) or 0.0
-                        if obj.metadata is not None
-                        else 0.0
-                    ),
-                }
-                for obj in objects
-            ])
-
-        def page_key_of(doc: Dict[str, Any]) -> str:
-            return (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
-
-        def unique_pages(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            found = []
-            seen = set()
-            for doc in docs:
-                key = page_key_of(doc)
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                found.append(doc)
-                if len(found) >= fetch_pages:
-                    break
-            return found
-
-        if by_date:
-            # Сортировка по дате до нарезки. RRF здесь меняет состав окна,
-            # и вторая страница перестаёт быть продолжением первой.
-            ordered = order_pages_by_date(
-                [doc for ranked in ranked_lists for doc in ranked],
-                sort_by,
-            )
-        else:
-            ordered = self._fuse_rrf(ranked_lists)
-        pages = unique_pages(ordered)
-        if not pages:
-            self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
-            return catalog_page([], 0)
-
-        if hybrid_score:
-            pages = await self.reranker.rerank.remote(
-                query, request_id, pages, top_k=len(pages), alpha=0.8
-            )
-            before_cutoff = len(pages)
-            pages = [
-                doc for doc in pages
-                if float(doc.get("combined_score") or 0.0) > CATALOG_SCORE_MIN
+            pending = [
+                (slug, asyncio.to_thread(run_query, collection, with_product(meta_name, legacy)))
+                for slug, collection, meta_name, legacy in jobs
             ]
+            fetch_start = time.perf_counter()
+            results = await asyncio.gather(*(task for _, task in pending))
+            grouped = [(name, grouped_objects(res)) for (name, _), res in zip(pending, results)]
             self.logger.info(
-                f"[req: {request_id}] Catalog score cutoff > {CATALOG_SCORE_MIN}: "
-                f"{before_cutoff} -> {len(pages)}"
+                f"[req: {request_id}] Catalog search in {time.perf_counter() - fetch_start:.3f}s: "
+                + ", ".join(f"{name} - {len(objects)} pages" for name, objects in grouped)
             )
-        else:
-            self.logger.info(
-                f"[req: {request_id}] Catalog rerank skipped: "
-                f"search_type={search_type}, sort_by={sort_by}"
-            )
-            for doc in pages:
-                doc["combined_score"] = float(
-                    doc.get("rrf_score", doc.get("hybrid_score", 0.0))
+
+            ranked_lists = []
+            for product, objects in grouped:
+                ranked_lists.append([
+                    {
+                        "title": obj.properties.get("title", "") or "",
+                        "page_content": obj.properties.get("page_content", "") or "",
+                        "page_url": obj.properties.get("page_url", "") or "",
+                        "source": obj.properties.get("source", "") or "",
+                        "product": obj.properties.get("product", "") or product,
+                        "product_name": obj.properties.get("product_name", "") or "",
+                        "version": obj.properties.get("version", "") or "",
+                        "section": obj.properties.get("section", "") or "",
+                        "tags": _as_str_list(obj.properties.get("tags")),
+                        "categories": _as_str_list(obj.properties.get("categories")),
+                        "published_at": normalize_article_time(obj.properties.get("published_at")),
+                        "updated_at": normalize_article_time(obj.properties.get("updated_at")),
+                        "hybrid_score": float(
+                            getattr(obj.metadata, "score", None) or 0.0
+                            if obj.metadata is not None
+                            else 0.0
+                        ),
+                    }
+                    for obj in objects
+                ])
+
+            def page_key_of(doc: Dict[str, Any]) -> str:
+                return (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
+
+            def unique_pages(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                found = []
+                seen = set()
+                for doc in docs:
+                    key = page_key_of(doc)
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    found.append(doc)
+                    if len(found) >= fetch_pages:
+                        break
+                return found
+
+            if by_date:
+                # Сортировка по дате до нарезки. RRF здесь меняет состав окна,
+                # и вторая страница перестаёт быть продолжением первой.
+                ordered = order_pages_by_date(
+                    [doc for ranked in ranked_lists for doc in ranked],
+                    sort_by,
                 )
+            else:
+                ordered = self._fuse_rrf(ranked_lists)
+            pages = unique_pages(ordered)
+            if not pages:
+                self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
+                self._catalog_result_put(cache_key, [])
+                return catalog_page([], 0)
+
+            if hybrid_score:
+                pages = await self.reranker.rerank.remote(
+                    query, request_id, pages, top_k=len(pages), alpha=0.8,
+                    max_chars=CATALOG_RERANK_CHARS,
+                    max_length=CATALOG_RERANK_MAX_LENGTH,
+                )
+                before_cutoff = len(pages)
+                pages = [
+                    doc for doc in pages
+                    if float(doc.get("combined_score") or 0.0) > CATALOG_SCORE_MIN
+                ]
+                self.logger.info(
+                    f"[req: {request_id}] Catalog score cutoff > {CATALOG_SCORE_MIN}: "
+                    f"{before_cutoff} -> {len(pages)}"
+                )
+            else:
+                self.logger.info(
+                    f"[req: {request_id}] Catalog rerank skipped: "
+                    f"search_type={search_type}, sort_by={sort_by}"
+                )
+                for doc in pages:
+                    doc["combined_score"] = float(
+                        doc.get("rrf_score", doc.get("hybrid_score", 0.0))
+                    )
+            self._catalog_result_put(cache_key, pages)
         total = len(pages)
         selected = list(pages[offset:offset + page_size])
         self.logger.info(
