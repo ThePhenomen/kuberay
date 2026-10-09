@@ -87,6 +87,9 @@ def _clean_filter_value(value: Optional[str]) -> Optional[str]:
     return text or None
 
 
+LATEST_VERSION = "latest"
+
+
 def _version_sort_key(version: str):
     parts = []
     for piece in version.split("."):
@@ -95,6 +98,14 @@ def _version_sort_key(version: str):
         else:
             parts.append((1, piece))
     return parts
+
+
+def _latest_version(versions) -> Optional[str]:
+    """Самый большой номер. Слово latest само версией не считается."""
+    real = [version for version in versions if version and version.casefold() != LATEST_VERSION]
+    if not real:
+        return None
+    return max(real, key=_version_sort_key)
 
 
 def _catalog_record(
@@ -234,11 +245,35 @@ def build_catalog(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     kb_target = targets.get("kb")
     if kb_target:
         targets[KB_PRODUCT_LABEL.casefold()] = list(kb_target)
+
+    # latest — псевдоним номера, в индексе его нет. У каждого продукта свой.
+    latest: Dict[str, str] = {}
+    latest_by_slug: Dict[str, List[tuple]] = {}
+    for item in products:
+        newest = _latest_version(item["versions"])
+        if not newest:
+            continue
+        item["versions"] = [
+            version for version in item["versions"] if version.casefold() != LATEST_VERSION
+        ]
+        item["versions"].append(LATEST_VERSION)
+        slug = item["product"]
+        name = item["product_name"]
+        latest_by_slug.setdefault(slug, []).append((name, newest))
+        for key in (slug, name):
+            folded = key.casefold()
+            if not folded:
+                continue
+            current = latest.get(folded)
+            if current is None or _version_sort_key(newest) > _version_sort_key(current):
+                latest[folded] = newest
     return {
         "products": products,
         "categories": sorted(categories),
         "tags": sorted(tags),
         "targets": targets,
+        "latest": latest,
+        "latest_by_slug": latest_by_slug,
     }
 
 
@@ -1275,8 +1310,26 @@ class Searcher:
             # (slug, collection, точное имя меты или None, legacy-строка для неизвестного продукта)
             # None в имени меты — вся коллекция. Legacy нужен, пока каталог не знает это имя.
             jobs = []
-            if product_name:
+            use_latest = bool(version and version.casefold() == LATEST_VERSION)
+            catalog = None
+            if product_name or use_latest:
                 catalog = await asyncio.to_thread(self._catalog)
+            latest_map = (catalog or {}).get("latest") or {}
+            latest_by_slug = (catalog or {}).get("latest_by_slug") or {}
+            version_filter = version
+            if use_latest:
+                if product_name:
+                    version_filter = latest_map.get(product_name.casefold())
+                    if not version_filter:
+                        self.logger.info(
+                            f"[req: {request_id}] Catalog latest has no version "
+                            f"for product_name={product_name}"
+                        )
+                        self._catalog_result_put(cache_key, [])
+                        return catalog_page([], 0)
+                else:
+                    version_filter = None
+            if product_name:
                 planned = catalog.get("targets", {}).get(product_name.casefold())
                 if planned:
                     for slug, meta_name in planned:
@@ -1293,10 +1346,12 @@ class Searcher:
                     (slug, collection, None, None)
                     for slug, collection in self.product_collections.items()
                 ]
+            if use_latest and not product_name:
+                jobs = [job for job in jobs if latest_by_slug.get(job[0])]
             collections = [(slug, collection) for slug, collection, _meta, _legacy in jobs]
 
             shared_filter = catalog_filter(
-                version=version,
+                version=version_filter,
                 section=section,
                 tags=tags,
                 categories=categories,
@@ -1309,7 +1364,8 @@ class Searcher:
                 f"collections={[name for name, _ in collections]}, "
                 f"search_type={search_type}, sort_by={sort_by}, "
                 f"top_k={top_k}, page={page}, count={page_size}, context_chars={context_chars}, "
-                f"product_name={product_name}, version={version}, section={section}, "
+                f"product_name={product_name}, version={version}, "
+                f"version_filter={version_filter}, section={section}, "
                 f"tags={tags or None}, categories={categories or None}, "
                 f"like_word={like_word or None}, words={words or None}"
             )
@@ -1359,7 +1415,29 @@ class Searcher:
                             Filter.by_property("page_content").like(f"*{word.casefold()}*")
                         )
                 clauses.append(Filter.by_property("updated_at").is_none(False))
-            def with_product(meta_name: Optional[str], legacy: Optional[str]):
+            def latest_clause(slug: str):
+                """Своя последняя версия этой коллекции. Один номер — равный фильтр."""
+                specs = latest_by_slug.get(slug) or []
+                numbers = {ver for _name, ver in specs}
+                if len(numbers) == 1:
+                    return Filter.by_property("version").equal(next(iter(numbers)))
+                filters = []
+                for name, ver in specs:
+                    version_f = Filter.by_property("version").equal(ver)
+                    if name:
+                        filters.append(Filter.all_of([
+                            Filter.by_property("product_name").equal(name),
+                            version_f,
+                        ]))
+                    else:
+                        filters.append(version_f)
+                if not filters:
+                    return None
+                if len(filters) == 1:
+                    return filters[0]
+                return Filter.any_of(filters)
+
+            def with_product(slug: str, meta_name: Optional[str], legacy: Optional[str]):
                 extra = None
                 if legacy:
                     extra = Filter.any_of([
@@ -1369,6 +1447,10 @@ class Searcher:
                 elif meta_name:
                     extra = Filter.by_property("product_name").equal(meta_name)
                 parts = list(clauses)
+                if use_latest and not product_name:
+                    own_latest = latest_clause(slug)
+                    if own_latest is not None:
+                        parts.append(own_latest)
                 if extra is not None:
                     parts.append(extra)
                 if not parts:
@@ -1452,7 +1534,7 @@ class Searcher:
                 return list(res.objects or [])
 
             pending = [
-                (slug, asyncio.to_thread(run_query, collection, with_product(meta_name, legacy)))
+                (slug, asyncio.to_thread(run_query, collection, with_product(slug, meta_name, legacy)))
                 for slug, collection, meta_name, legacy in jobs
             ]
             fetch_start = time.perf_counter()
