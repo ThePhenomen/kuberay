@@ -19,7 +19,7 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
 import weaviate
 from weaviate.classes.init import Auth
-from weaviate.classes.query import BM25Operator, Filter, GroupBy, MetadataQuery, Sort
+from weaviate.classes.query import BM25Operator, Filter, GroupBy, HybridFusion, MetadataQuery, Sort
 
 import logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -37,15 +37,18 @@ def init_logger():
 
 logger = init_logger()
 
-DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or "starguard"
+DEFAULT_PRODUCT = os.getenv("DEFAULT_PRODUCT") or "zvirt"
 DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
 # Weaviate применяет limit до group_by, поэтому несколько чанков одной страницы
 # съедают лимит. Небольшой запас объектов нужен, чтобы после склейки осталось
 # запрошенное число страниц.
 CATALOG_GROUP_SLACK = 10
-# Сколько уникальных страниц набираем, прежде чем резать по score и отдавать страницу выдачи.
-# total не больше этого числа: это все страницы, которые успели получить оценку.
+# Точный поиск одного слова и сортировка по дате идут через fetch_objects.
+# У него нет score, поэтому autocut неприменим. total для них не больше этого числа.
 CATALOG_RANK_PAGES = int(os.getenv("CATALOG_RANK_PAGES", "200"))
+# Сколько скачков score выдержать в hybrid и BM25, потом оборвать выдачу.
+# 3 — три группы близких оценок. Для hybrid слияние должно быть RELATIVE_SCORE.
+CATALOG_HYBRID_AUTO_LIMIT = int(os.getenv("CATALOG_HYBRID_AUTO_LIMIT", "3"))
 # Итоговый score: 0.8 нормированного реранкера и 0.2 предварительного ранга, от 0 до 1
 # на всём набранном наборе. Хвост не выше 0.2 не входит в total. Сырой логит реранкера
 # для отсечения не используем: у подходящих страниц он тоже бывает отрицательным.
@@ -469,7 +472,7 @@ HYDE_MAX_TOKENS = int(os.getenv("HYDE_MAX_TOKENS", "96"))
 RERANK_MAX_LENGTH = int(os.getenv("RERANK_MAX_LENGTH", "2048"))
 RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "6000"))
 RERANK_BATCH_SIZE = int(os.getenv("RERANK_BATCH_SIZE", "32"))
-# Каталог оценивает до 200 страниц. В модель идут заголовок и 1000 символов текста.
+# В каталожный реранкер идут заголовок и 1000 символов текста.
 CATALOG_RERANK_CHARS = int(os.getenv("CATALOG_RERANK_CHARS", "1000"))
 CATALOG_RERANK_MAX_LENGTH = int(os.getenv("CATALOG_RERANK_MAX_LENGTH", "512"))
 # Повтор того же запроса с другими page/count берёт уже посчитанный список.
@@ -1234,7 +1237,8 @@ class Searcher:
 
         Сначала набирается общий список страниц, потом из него вырезается страница
         выдачи. total — длина этого списка. В гибридном поиске по релевантности
-        в список входят только страницы с итоговым score выше порога.
+        длину списка задаёт autocut Weaviate, затем остаются страницы с итоговым
+        score выше порога.
         Сортировка newest/oldest делается в Weaviate по полю updated_at.
         Размер страницы задаёт count. top_k на выдачу не влияет.
         Одинаковый запрос и фильтры две минуты отдают уже посчитанный список,
@@ -1378,7 +1382,9 @@ class Searcher:
                 return url.split("#")[0].rstrip("/")
 
             def scan_objects(collection, query_filter):
-                """fetch_objects не умеет group_by. Листаем объекты, пока не наберём уникальные страницы."""
+                """fetch_objects не считает score, поэтому autocut к нему неприменим.
+                Листаем объекты с фильтром и сортировкой, пока не наберём уникальные страницы.
+                """
                 found = []
                 seen = set()
                 object_offset = 0
@@ -1421,16 +1427,16 @@ class Searcher:
                         operator=BM25Operator.and_(),
                         filters=query_filter,
                         group_by=page_group,
-                        limit=fetch_limit,
+                        auto_limit=CATALOG_HYBRID_AUTO_LIMIT,
                         return_metadata=MetadataQuery(score=True),
                         return_properties=return_properties,
                     )
                 return collection.query.hybrid(
                     query=query,
                     alpha=0.2,
-                    limit=fetch_limit,
+                    fusion_type=HybridFusion.RELATIVE_SCORE,
+                    auto_limit=CATALOG_HYBRID_AUTO_LIMIT,
                     filters=query_filter,
-                    group_by=page_group,
                     return_metadata=MetadataQuery(score=True),
                     return_properties=return_properties,
                 )
@@ -1485,7 +1491,7 @@ class Searcher:
             def page_key_of(doc: Dict[str, Any]) -> str:
                 return (doc.get("page_url") or doc.get("source") or "").split("#")[0].rstrip("/")
 
-            def unique_pages(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            def unique_pages(docs: List[Dict[str, Any]], cap: Optional[int]) -> List[Dict[str, Any]]:
                 found = []
                 seen = set()
                 for doc in docs:
@@ -1494,7 +1500,7 @@ class Searcher:
                         continue
                     seen.add(key)
                     found.append(doc)
-                    if len(found) >= fetch_pages:
+                    if cap is not None and len(found) >= cap:
                         break
                 return found
 
@@ -1507,7 +1513,8 @@ class Searcher:
                 )
             else:
                 ordered = self._fuse_rrf(ranked_lists)
-            pages = unique_pages(ordered)
+            # hybrid и BM25 уже обрезаны autocut. Одно слово и даты режем сами.
+            pages = unique_pages(ordered, fetch_pages if (by_date or like_word) else None)
             if not pages:
                 self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
                 self._catalog_result_put(cache_key, [])
