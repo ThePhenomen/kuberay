@@ -43,10 +43,14 @@ DEFAULT_PRODUCT_VERSION = os.getenv("DEFAULT_PRODUCT_VERSION", "latest")
 # съедают лимит. Небольшой запас объектов нужен, чтобы после склейки осталось
 # запрошенное число страниц.
 CATALOG_GROUP_SLACK = 10
+# Сколько уникальных страниц набираем, прежде чем резать по score и отдавать страницу выдачи.
+# total не больше этого числа: это все страницы, которые успели получить оценку.
+CATALOG_RANK_PAGES = int(os.getenv("CATALOG_RANK_PAGES", "200"))
 # Итоговый score: 0.8 нормированного реранкера и 0.2 предварительного ранга, от 0 до 1
-# внутри текущей страницы. Хвост ниже 0.2 не отдаём. Сырой логит реранкера для
-# отсечения не используем: у подходящих страниц он тоже бывает отрицательным.
+# на всём набранном наборе. Хвост не выше 0.2 не входит в total. Сырой логит реранкера
+# для отсечения не используем: у подходящих страниц он тоже бывает отрицательным.
 CATALOG_SCORE_MIN = float(os.getenv("CATALOG_SCORE_MIN", "0.2"))
+KB_PRODUCT_LABEL = "База знаний"
 
 LOG_SNIPPET_LEN = int(os.getenv("LOG_SNIPPET_LEN", "300"))
 
@@ -221,6 +225,12 @@ def build_catalog(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 add_target(key, item["product"], None)
 
     products.sort(key=lambda item: item["product"])
+    for item in products:
+        if item["product"] == "kb" and item["product_name"].casefold() in ("", "kb"):
+            item["product_name"] = KB_PRODUCT_LABEL
+    kb_target = targets.get("kb")
+    if kb_target:
+        targets[KB_PRODUCT_LABEL.casefold()] = list(kb_target)
     return {
         "products": products,
         "categories": sorted(categories),
@@ -229,14 +239,26 @@ def build_catalog(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _any_of_equal(prop: str, values: List[str]):
+    """Несколько значений одного поля: достаточно любого."""
+    filters = [Filter.by_property(prop).equal(value) for value in values]
+    if len(filters) == 1:
+        return filters[0]
+    return Filter.any_of(filters)
+
+
 def catalog_filter(
     product_name: Optional[str] = None,
     version: Optional[str] = None,
-    section: Optional[str] = None,
+    section: Optional[List[str]] = None,
     tags: Optional[List[str]] = None,
     categories: Optional[List[str]] = None,
 ):
-    """Weaviate-фильтр только из переданных полей. None — ограничения нет."""
+    """Weaviate-фильтр только из переданных полей. None — ограничения нет.
+
+    Разные поля соединяются через «и». Несколько section, tags или categories —
+    через «или».
+    """
     clauses = []
     if product_name:
         clauses.append(Filter.any_of([
@@ -246,16 +268,49 @@ def catalog_filter(
     if version:
         clauses.append(Filter.by_property("version").equal(version))
     if section:
-        clauses.append(Filter.by_property("section").equal(section))
+        clauses.append(_any_of_equal("section", section))
     if tags:
-        clauses.append(Filter.by_property("tags").contains_all(tags))
+        clauses.append(Filter.by_property("tags").contains_any(tags))
     if categories:
-        clauses.append(Filter.by_property("categories").contains_all(categories))
+        clauses.append(Filter.by_property("categories").contains_any(categories))
     if not clauses:
         return None
     if len(clauses) == 1:
         return clauses[0]
     return Filter.all_of(clauses)
+
+
+def _is_kb_doc(doc: Dict[str, Any]) -> bool:
+    product = str(doc.get("product") or "").strip().casefold()
+    name = str(doc.get("product_name") or "").strip().casefold()
+    url = str(doc.get("page_url") or doc.get("source") or "")
+    return product == "kb" or name == "kb" or "/kb/" in url
+
+
+def _is_kb_article(doc: Dict[str, Any]) -> bool:
+    section = str(doc.get("section") or "").strip()
+    url = str(doc.get("page_url") or doc.get("source") or "")
+    return section == "Статьи" or "/kb/articles/" in url
+
+
+def present_product_name(doc: Dict[str, Any]) -> str:
+    """В ответе страница базы без имени продукта подписана «База знаний», не kb."""
+    name = str(doc.get("product_name") or "").strip()
+    product = str(doc.get("product") or "").strip()
+    if _is_kb_doc(doc) and (not name or name.casefold() == "kb"):
+        return KB_PRODUCT_LABEL
+    return name or product
+
+
+def present_categories(doc: Dict[str, Any]) -> List[str]:
+    """У страницы базы в categories есть «статьи» или «база знаний»."""
+    categories = _as_str_list(doc.get("categories"))
+    if not _is_kb_doc(doc):
+        return categories
+    label = "статьи" if _is_kb_article(doc) else "база знаний"
+    if label in categories:
+        return categories
+    return [label, *categories]
 
 
 def normalize_article_time(value: Any) -> str:
@@ -586,11 +641,11 @@ class SearchRequest(BaseModel):
     query: str
     top_k: int = 5
     page: int = Field(default=1, ge=1)
-    count: Optional[int] = Field(default=None, ge=1, le=100)
+    count: int = Field(default=50, ge=1, le=100)
     context_chars: int = 60
     product_name: Optional[str] = None
     version: Optional[str] = None
-    section: Optional[str] = None
+    section: Optional[str | List[str]] = None
     tags: Optional[str | List[str]] = None
     categories: Optional[str | List[str]] = None
     search_type: Literal["hybrid", "exact"] = "hybrid"
@@ -1111,7 +1166,7 @@ class Searcher:
         context_chars: int = 60,
         product_name: Optional[str] = None,
         version: Optional[str] = None,
-        section: Optional[str] = None,
+        section: Optional[str | List[str]] = None,
         tags: Optional[List[str]] = None,
         categories: Optional[List[str]] = None,
         search_type: str = "hybrid",
@@ -1119,14 +1174,15 @@ class Searcher:
     ) -> Dict[str, Any]:
         """Поиск по коллекциям для /search. Фильтры применяются только если переданы.
 
-        Во всех режимах у Weaviate запрашивается только текущая страница выдачи.
-        Для гибридного поиска по релевантности в неё попадают страницы с оценкой
-        реранкера выше порога. Сортировка newest/oldest делается в Weaviate
-        по полю updated_at.
+        Сначала набирается общий список страниц, потом из него вырезается страница
+        выдачи. total — длина этого списка. В гибридном поиске по релевантности
+        в список входят только страницы с итоговым score выше порога.
+        Сортировка newest/oldest делается в Weaviate по полю updated_at.
+        Размер страницы задаёт count. top_k на выдачу не влияет.
         """
         docs_start_time = time.perf_counter()
         page = max(1, int(page))
-        page_size = count if count is not None else top_k
+        page_size = 50 if count is None else count
         page_size = min(100, max(1, int(page_size)))
         offset = (page - 1) * page_size
 
@@ -1139,7 +1195,7 @@ class Searcher:
             }
         product_name = _clean_filter_value(product_name)
         version = _clean_filter_value(version)
-        section = _clean_filter_value(section)
+        section = _as_str_list(section)
         tags = _as_str_list(tags)
         categories = _as_str_list(categories)
 
@@ -1206,8 +1262,10 @@ class Searcher:
         ]
         by_date = sort_by in ("newest", "oldest")
         hybrid_score = (not exact) and sort_by == "score"
-        fetch_pages = offset + page_size
-        fetch_limit = fetch_pages + CATALOG_GROUP_SLACK
+        # Один и тот же набор для любой страницы: total не зависит от page и count.
+        # limit больше числа групп, потому что Weaviate режет объекты до склейки чанков.
+        fetch_pages = CATALOG_RANK_PAGES
+        fetch_limit = CATALOG_RANK_PAGES * 3 + CATALOG_GROUP_SLACK
         page_group = GroupBy(
             prop="page_url",
             number_of_groups=fetch_pages,
@@ -1384,32 +1442,32 @@ class Searcher:
             self.logger.warning(f"[req: {request_id}] Catalog search found no documents")
             return catalog_page([], 0)
 
-        total = len(pages)
-        selected = list(pages[offset:offset + page_size])
-        if hybrid_score and selected:
-            selected = await self.reranker.rerank.remote(
-                query, request_id, selected, top_k=len(selected), alpha=0.8
+        if hybrid_score:
+            pages = await self.reranker.rerank.remote(
+                query, request_id, pages, top_k=len(pages), alpha=0.8
             )
-            before_cutoff = len(selected)
-            selected = [
-                doc for doc in selected
+            before_cutoff = len(pages)
+            pages = [
+                doc for doc in pages
                 if float(doc.get("combined_score") or 0.0) > CATALOG_SCORE_MIN
             ]
             self.logger.info(
                 f"[req: {request_id}] Catalog score cutoff > {CATALOG_SCORE_MIN}: "
-                f"{before_cutoff} -> {len(selected)}"
+                f"{before_cutoff} -> {len(pages)}"
             )
         else:
             self.logger.info(
                 f"[req: {request_id}] Catalog rerank skipped: "
                 f"search_type={search_type}, sort_by={sort_by}"
             )
-            for doc in selected:
+            for doc in pages:
                 doc["combined_score"] = float(
                     doc.get("rrf_score", doc.get("hybrid_score", 0.0))
                 )
+        total = len(pages)
+        selected = list(pages[offset:offset + page_size])
         self.logger.info(
-            f"[req: {request_id}] Grouped {len(pages)} pages, "
+            f"[req: {request_id}] Grouped {total} pages, "
             f"sort_by={sort_by}, total={total}, page={page}, returning {len(selected)}"
         )
 
@@ -1417,14 +1475,14 @@ class Searcher:
         for doc in selected:
             documents.append({
                 "title": doc.get("title", ""),
-                "categories": doc.get("categories") or [],
+                "categories": present_categories(doc),
                 "tags": doc.get("tags") or [],
                 "section": doc.get("section", ""),
                 "content": snippet_around_query(
                     doc.get("page_content", ""), query, context_chars
                 ),
                 "page_url": doc.get("page_url", ""),
-                "product_name": doc.get("product_name") or doc.get("product", ""),
+                "product_name": present_product_name(doc),
                 "version": doc.get("version", ""),
                 "published_at": doc.get("published_at") or "",
                 "updated_at": doc.get("updated_at") or "",
@@ -2154,7 +2212,7 @@ class SmartRouter:
             context_chars=req.context_chars,
             product_name=req.product_name,
             version=req.version,
-            section=req.section,
+            section=_as_str_list(req.section),
             tags=_as_str_list(req.tags),
             categories=_as_str_list(req.categories),
             search_type=req.search_type,
